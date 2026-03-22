@@ -1,0 +1,7 @@
+{
+  "project_dir": "PRJCT",
+  "reports_dir": "RPRTS",
+  "database_dir": "DTB",
+  "llm_dir": "LLM",
+  "backup_dir": "BCKP"
+}

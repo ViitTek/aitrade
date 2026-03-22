@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tester"
+  short_description: "Testovani AIlauncheru a finalni regresni overeni"
+  default_prompt: "Use $ailauncher-tester to test AIlauncher, verify key flows, and return a findings-first report."

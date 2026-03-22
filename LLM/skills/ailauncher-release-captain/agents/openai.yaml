@@ -1,0 +1,4 @@
+interface:
+  display_name: "ReleaseCaptain"
+  short_description: "Rizeni blockeru a release pripravenosti AIlauncheru"
+  default_prompt: "Use $ailauncher-release-captain to organize AIlauncher blockers, priorities, and a clear go/no-go release verdict."

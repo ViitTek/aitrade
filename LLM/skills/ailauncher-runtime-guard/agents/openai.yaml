@@ -1,0 +1,4 @@
+interface:
+  display_name: "RuntimeGuard"
+  short_description: "Provozni stabilita, watchdogy a recovery AIlauncheru"
+  default_prompt: "Use $ailauncher-runtime-guard to assess AIlauncher operational stability, watchdog behavior, and recovery gaps before release."

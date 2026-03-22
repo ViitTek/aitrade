@@ -1,0 +1,88 @@
+# Core secrets
+PRJCT/python-core/.env
+PRJCT/python-core/.env.*
+PRJCT/**/.env
+PRJCT/**/.env.*
+
+# Root folders not intended for GitHub
+DTB/
+RPRTS/
+BCKP/
+_build_verify/
+
+# LLM runtime assets
+LLM/models/
+LLM/llama/
+
+# Keep curated project skills if desired
+!LLM/
+!LLM/skills/
+!LLM/skills/**
+
+# Runtime state and live artifacts
+PRJCT/_runtime/
+PRJCT/logs/
+PRJCT/**/logs/
+PRJCT/**/state.json
+PRJCT/**/watchdog.log
+PRJCT/**/run.log
+PRJCT/**/scheduler.log
+
+# Shadow tests and generated reports if ever created under project tree
+PRJCT/_shadow_tests/
+PRJCT/_shadow-reports/
+PRJCT/qa/runs/
+
+# Python caches and virtual environments
+PRJCT/**/__pycache__/
+PRJCT/**/*.pyc
+PRJCT/**/*.pyo
+PRJCT/**/*.pyd
+PRJCT/**/.pytest_cache/
+PRJCT/**/.mypy_cache/
+PRJCT/**/.ruff_cache/
+PRJCT/**/.coverage
+PRJCT/**/htmlcov/
+PRJCT/**/venv/
+PRJCT/**/.venv/
+PRJCT/**/venv_broken*/
+PRJCT/python-core/venv/
+PRJCT/python-core/venv_broken_*/
+
+# Node / dashboard build artifacts
+PRJCT/dashboard/node_modules/
+PRJCT/dashboard/dist/
+PRJCT/dashboard/.vite/
+
+# .NET / Visual Studio build artifacts
+PRJCT/**/bin/
+PRJCT/**/obj/
+PRJCT/**/*.user
+PRJCT/**/*.suo
+PRJCT/**/*.userosscache
+PRJCT/**/*.sln.docstates
+PRJCT/**/*.WebView2/
+
+# Databases, dumps, backups, archives
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+*.dmp
+*.dump
+*.zip
+*.7z
+*.rar
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.vs/
+.idea/
+
+# Historical repo noise from pre-layout structure
+_bckp/
+mongo_dump/
+MongoDB/
+models/

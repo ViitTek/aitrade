@@ -1,0 +1,4 @@
+interface:
+  display_name: "BackendIntegrator"
+  short_description: "Integrace API, dashboardu a stacku AIlauncheru"
+  default_prompt: "Use $ailauncher-backend-integrator to debug AIlauncher backend integration, health endpoints, and stack startup compatibility."

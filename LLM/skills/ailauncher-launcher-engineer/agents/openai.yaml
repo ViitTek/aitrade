@@ -1,0 +1,4 @@
+interface:
+  display_name: "LauncherEngineer"
+  short_description: "Vlastnik C# launcheru a orchestrace AIlauncheru"
+  default_prompt: "Use $ailauncher-launcher-engineer to analyze or improve the AIlauncher C# UI, process orchestration, and launcher recovery behavior."

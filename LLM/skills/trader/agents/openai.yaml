@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trader"
+  short_description: "Trade system operations and shadow evaluation workflow"
+  default_prompt: "Use this skill to run, monitor, and evaluate AIInvest trading and shadow-test operations safely and consistently."

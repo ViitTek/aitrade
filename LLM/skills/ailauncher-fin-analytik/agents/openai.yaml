@@ -1,0 +1,4 @@
+interface:
+  display_name: "FinAnalytik"
+  short_description: "Financni analyza ziskovosti a guardrailu AIlauncheru"
+  default_prompt: "Use $ailauncher-fin-analytik to evaluate AIlauncher test outputs, fee-aware profitability, and the safest next step."
