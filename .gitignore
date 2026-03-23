@@ -9,6 +9,7 @@ DTB/
 RPRTS/
 BCKP/
 _build_verify/
+_transfer/
 
 # LLM runtime assets
 LLM/models/
