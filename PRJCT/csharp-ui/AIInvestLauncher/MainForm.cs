@@ -265,7 +265,11 @@ public sealed class MainForm : Form
         _logTradedSymbols.HandleCreated += (_, __) => TryApplyDarkScrollbars(_logTradedSymbols);
         if (_logTradedSymbols.IsHandleCreated) TryApplyDarkScrollbars(_logTradedSymbols);
         SetPage(0);
-        Shown += (_, __) => TryEnableDarkTitleBar();
+        Shown += async (_, __) =>
+        {
+            TryEnableDarkTitleBar();
+            await EnsureProjectAutostartOnLaunchAsync();
+        };
         HandleCreated += (_, __) => TryEnableDarkTitleBar();
 
         _healthTimer.Tick += async (_, __) =>
@@ -919,12 +923,18 @@ public sealed class MainForm : Form
     {
         return ResolveLayoutDir("project_dir", "PRJCT");
     }
+    private string DatabaseRootDir()
+    {
+        return ResolveLayoutDir("database_dir", "DTB");
+    }
     private string ReportsRootDir()
     {
         return ResolveLayoutDir("reports_dir", "RPRTS");
     }
     private string PythonCoreDirPath() => Path.Combine(ProjectDirPath(), "python-core");
     private string DashboardDirPath() => Path.Combine(ProjectDirPath(), "dashboard");
+    private string MongoDaemonPath() => Path.Combine(DatabaseRootDir(), "MongoDB", "server", "6.0", "bin", "mongod.exe");
+    private string MongoDataDirPath() => Path.Combine(DatabaseRootDir(), "MongoDB", "data");
     private string ProjectScriptPath(string scriptName) => Path.Combine(ProjectDirPath(), scriptName);
 
     private static bool IsIbkrGatewayRunning()
@@ -1170,7 +1180,7 @@ public sealed class MainForm : Form
         }
     }
 
-    private async Task StartProjectAsync(long actionId)
+    private async Task StartProjectAsync(long actionId, bool autoStartBot = true)
     {
         try
         {
@@ -1182,44 +1192,60 @@ public sealed class MainForm : Form
             var dashDir = DashboardDirPath();
             var coreDir = PythonCoreDirPath();
             var npm = @"C:\Program Files\nodejs\npm.cmd";
+            var mongoOk = await EnsureMongoDbAsync();
 
             if (!File.Exists(py))
             {
                 AppendLog(_logLauncher, $"Missing python venv: {py}");
                 return;
             }
+            if (!mongoOk)
+                AppendLog(_logLauncher, "MongoDB is still unavailable after start attempt. Collector may fail.");
 
             var apiPortText = _txtApiPort.Text.Trim();
             var backtestPortText = _txtBacktestPort.Text.Trim();
             var dashPortText = _txtDashPort.Text.Trim();
-            var skipDashboardStart = false;
+            var apiHealthy = await IsStrictOkAsync($"{ApiBase()}/health");
+            var backtestHealthy = await IsStrictOkAsync($"{BacktestBase()}/health");
+            var dashHealthy = await IsStrictOkAsync(DashboardUrl(), timeoutSec: 5);
 
-            foreach (var ptxt in new[] { apiPortText, backtestPortText, dashPortText })
+            async Task<bool> PrepareComponentPortAsync(string label, string portText, bool healthy)
             {
-                if (!int.TryParse(ptxt, out var pnum)) continue;
-                if (!IsPortListening(pnum)) continue;
+                if (!int.TryParse(portText, out var pnum)) return false;
+                if (!IsPortListening(pnum)) return false;
 
-                StopByListeningPort(ptxt);
-                await Task.Delay(500);
-                if (!IsPortListening(pnum)) continue;
-
-                // API/backtest ports are mandatory for project start. Dashboard port can be reused.
-                if (string.Equals(ptxt, dashPortText, StringComparison.Ordinal))
+                if (healthy)
                 {
-                    skipDashboardStart = true;
-                    AppendLog(_logLauncher, $"Dashboard port {pnum} is already occupied. Reusing existing dashboard process.");
-                    continue;
+                    AppendLog(_logLauncher, $"{label} already healthy on port {pnum}. Reusing existing process.");
+                    return true;
                 }
 
-                AppendLog(_logLauncher, $"Cannot start project: port {pnum} is still occupied.");
-                return;
+                AppendLog(_logLauncher, $"{label} port {pnum} is occupied but unhealthy. Restarting process.");
+                StopByListeningPort(portText);
+                await Task.Delay(500);
+                if (!IsPortListening(pnum)) return false;
+
+                AppendLog(_logLauncher, $"Cannot start {label}: port {pnum} is still occupied.");
+                throw new InvalidOperationException($"{label} port {pnum} remains occupied.");
             }
+
+            var reuseApi = await PrepareComponentPortAsync("API", apiPortText, apiHealthy);
+            var reuseBacktest = await PrepareComponentPortAsync("BACKTEST", backtestPortText, backtestHealthy);
+            var reuseDashboard = await PrepareComponentPortAsync("DASHBOARD", dashPortText, dashHealthy);
+
+            NormalizeProcessRefs();
+            if (!reuseApi)
+                _apiProc = null;
+            if (!reuseBacktest)
+                _backtestProc = null;
+            if (!reuseDashboard)
+                _dashboardProc = null;
 
             _apiProc ??= StartProcess(py, $"-m uvicorn app:app --host 127.0.0.1 --port {apiPortText}", coreDir, "API");
             _backtestProc ??= StartProcess(py, $"-m uvicorn app:app --host 127.0.0.1 --port {backtestPortText}", coreDir, "BACKTEST");
             _collectorProc ??= StartProcess(py, "data_collector.py", coreDir, "COLLECTOR");
             // News worker runs inside API background tasks. Do not start a duplicate standalone process.
-            if (!skipDashboardStart)
+            if (!reuseDashboard)
             {
                 _dashboardProc ??= StartProcess(
                     "powershell.exe",
@@ -1231,7 +1257,7 @@ public sealed class MainForm : Form
             }
 
             await Task.Delay(1500);
-            if (_chkAutoStartBot.Checked)
+            if (autoStartBot && _chkAutoStartBot.Checked)
                 await EnsureBotAutostartAsync(actionId);
             if (EmbeddedDashboardEnabled && _web.CoreWebView2 != null) _web.CoreWebView2.Navigate(DashboardUrl());
             AppendLog(_logLauncher, "Start sequence finished.");
@@ -1257,6 +1283,17 @@ public sealed class MainForm : Form
                 else
                     await StartProjectAsync(actionId);
             }
+        );
+    }
+
+    private async Task EnsureProjectAutostartOnLaunchAsync()
+    {
+        await Task.Delay(500);
+        NormalizeProcessRefs();
+        AppendLog(_logLauncher, "Launch auto-start ensure requested (bot autostart skipped).");
+        await RunExclusiveProjectActionAsync(
+            "Ignored duplicate launch auto-start: another start/stop/restart is already in progress.",
+            actionId => StartProjectAsync(actionId, autoStartBot: false)
         );
     }
 
@@ -1494,13 +1531,13 @@ public sealed class MainForm : Form
     private void ReattachRuntimeProcesses()
     {
         if (_apiProc == null && int.TryParse(_txtApiPort.Text.Trim(), out var apiPort))
-            _apiProc = TryGetProcessById(TryReadRuntimePid("main", "api") ?? GetPidsFromNetstat(apiPort).FirstOrDefault());
+            _apiProc = TryAttachExpectedProcess("main", "api", () => GetPidsFromNetstat(apiPort).FirstOrDefault());
         if (_backtestProc == null && int.TryParse(_txtBacktestPort.Text.Trim(), out var backtestPort))
-            _backtestProc = TryGetProcessById(TryReadRuntimePid("main", "backtest") ?? GetPidsFromNetstat(backtestPort).FirstOrDefault());
+            _backtestProc = TryAttachExpectedProcess("main", "backtest", () => GetPidsFromNetstat(backtestPort).FirstOrDefault());
         if (_collectorProc == null)
-            _collectorProc = TryGetProcessById(TryReadRuntimePid("main", "collector") ?? FindCollectorProcessId());
+            _collectorProc = TryAttachExpectedProcess("main", "collector", FindCollectorProcessId);
         if (_dashboardProc == null && int.TryParse(_txtDashPort.Text.Trim(), out var dashPort))
-            _dashboardProc = TryGetProcessById(TryReadRuntimePid("main", "dashboard") ?? GetPidsFromNetstat(dashPort).FirstOrDefault());
+            _dashboardProc = TryAttachExpectedProcess("main", "dashboard", () => GetPidsFromNetstat(dashPort).FirstOrDefault());
     }
 
     private async Task EnsurePortsReleasedAsync()
@@ -1719,6 +1756,58 @@ public sealed class MainForm : Form
             }
         }
         catch { }
+        return null;
+    }
+
+    private bool IsExpectedTrackedProcess(Process? process, string component)
+    {
+        if (!IsAlive(process))
+            return false;
+
+        var cmd = TryGetCommandLine(process!);
+        if (string.IsNullOrWhiteSpace(cmd))
+            return false;
+
+        var c = cmd.ToLowerInvariant();
+        return component.ToLowerInvariant() switch
+        {
+            "api" => c.Contains(" -m uvicorn app:app") && c.Contains($"--port {_txtApiPort.Text.Trim()}"),
+            "backtest" => c.Contains(" -m uvicorn app:app") && c.Contains($"--port {_txtBacktestPort.Text.Trim()}"),
+            "collector" => c.Contains("data_collector.py"),
+            "dashboard" => c.Contains("\\vite\\bin\\vite.js") && c.Contains($"--port {_txtDashPort.Text.Trim()}"),
+            _ => false
+        };
+    }
+
+    private void DeleteRuntimeInfo(RuntimeComponentInfo? info)
+    {
+        if (info == null || string.IsNullOrWhiteSpace(info.RuntimePath))
+            return;
+
+        try
+        {
+            if (File.Exists(info.RuntimePath))
+                File.Delete(info.RuntimePath);
+        }
+        catch
+        {
+        }
+    }
+
+    private Process? TryAttachExpectedProcess(string scope, string component, Func<int?> fallbackPidFactory)
+    {
+        var runtimeInfo = TryReadRuntimeInfo(scope, component);
+        var runtimeProc = TryGetProcessById(runtimeInfo?.EffectivePid);
+        if (IsExpectedTrackedProcess(runtimeProc, component))
+            return runtimeProc;
+
+        var fallbackProc = TryGetProcessById(fallbackPidFactory());
+        if (IsExpectedTrackedProcess(fallbackProc, component))
+            return fallbackProc;
+
+        if (runtimeInfo != null)
+            DeleteRuntimeInfo(runtimeInfo);
+
         return null;
     }
 
@@ -2520,7 +2609,7 @@ public sealed class MainForm : Form
         {
             try
             {
-                var health = await IsOkAsync($"{ApiBase()}/health");
+                var health = await IsStrictOkAsync($"{ApiBase()}/health");
                 if (!health)
                 {
                     await Task.Delay(600);
@@ -2563,7 +2652,7 @@ public sealed class MainForm : Form
                     return;
                 try
                 {
-                    if (!await IsOkAsync($"{ApiBase()}/health"))
+                    if (!await IsStrictOkAsync($"{ApiBase()}/health"))
                     {
                         await Task.Delay(1500);
                         continue;
@@ -2649,11 +2738,16 @@ public sealed class MainForm : Form
             psi.EnvironmentVariables["PYTHONUTF8"] = "1";
             psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
         }
+        var shouldPersistProcessIo =
+            string.Equals(name, "API", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(name, "BACKTEST", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(name, "COLLECTOR", StringComparison.OrdinalIgnoreCase);
         var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
         p.OutputDataReceived += (_, e) =>
         {
             if (string.IsNullOrWhiteSpace(e.Data)) return;
             if (sink != null) AppendLog(sink, e.Data);
+            if (shouldPersistProcessIo) WriteFileLog($"{name} | {e.Data}");
             if (!string.Equals(name, "API", StringComparison.OrdinalIgnoreCase) &&
                 !string.Equals(name, "COLLECTOR", StringComparison.OrdinalIgnoreCase) &&
                 !string.Equals(name, "BACKTEST", StringComparison.OrdinalIgnoreCase) &&
@@ -2665,6 +2759,7 @@ public sealed class MainForm : Form
         {
             if (string.IsNullOrWhiteSpace(e.Data)) return;
             if (sink != null) AppendLog(sink, e.Data);
+            if (shouldPersistProcessIo) WriteFileLog($"{name} | ERROR | {e.Data}");
             if (!string.Equals(name, "API", StringComparison.OrdinalIgnoreCase) &&
                 !string.Equals(name, "COLLECTOR", StringComparison.OrdinalIgnoreCase) &&
                 !string.Equals(name, "BACKTEST", StringComparison.OrdinalIgnoreCase) &&
@@ -2674,14 +2769,111 @@ public sealed class MainForm : Form
         };
         p.Exited += (_, __) =>
         {
+            try
+            {
+                WriteFileLog($"{name} | EXIT | code={(p.HasExited ? p.ExitCode : -1)}");
+            }
+            catch
+            {
+            }
             if (sink != null) AppendLog(sink, $"{name} exited.");
             AppendLog(_logLauncher, $"{name} exited.");
         };
         p.Start();
         p.BeginOutputReadLine();
         p.BeginErrorReadLine();
+        WriteFileLog($"{name} | START | {file} {args} | wd={workDir}");
         AppendLog(_logLauncher, $"Started {name}: {file} {args}");
         return p;
+    }
+
+    private void StartDetachedProcess(string file, string args, string workDir, string name)
+    {
+        var psi = new ProcessStartInfo
+        {
+            FileName = file,
+            Arguments = args,
+            WorkingDirectory = workDir,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
+            CreateNoWindow = true
+        };
+        var p = new Process { StartInfo = psi, EnableRaisingEvents = true };
+        p.OutputDataReceived += (_, e) =>
+        {
+            if (string.IsNullOrWhiteSpace(e.Data)) return;
+            WriteFileLog($"{name} | {e.Data}");
+        };
+        p.ErrorDataReceived += (_, e) =>
+        {
+            if (string.IsNullOrWhiteSpace(e.Data)) return;
+            WriteFileLog($"{name} | ERROR | {e.Data}");
+        };
+        p.Exited += (_, __) =>
+        {
+            try
+            {
+                WriteFileLog($"{name} | EXIT | code={(p.HasExited ? p.ExitCode : -1)}");
+            }
+            catch
+            {
+            }
+        };
+        p.Start();
+        p.BeginOutputReadLine();
+        p.BeginErrorReadLine();
+        WriteFileLog($"{name} | START | {file} {args} | wd={workDir}");
+    }
+
+    private async Task<bool> EnsureMongoDbAsync()
+    {
+        if (IsPortListeningLocal(27017))
+            return true;
+
+        var runtimeInfo = TryReadRuntimeInfo("main", "mongodb");
+        var runtimeProc = TryGetProcessById(runtimeInfo?.EffectivePid);
+        if (runtimeInfo != null && !IsAlive(runtimeProc))
+        {
+            DeleteRuntimeInfo(runtimeInfo);
+            AppendLog(_logLauncher, "Removed stale MongoDB runtime metadata before restart.");
+        }
+
+        var mongoExe = MongoDaemonPath();
+        var mongoData = MongoDataDirPath();
+        if (!File.Exists(mongoExe))
+        {
+            AppendLog(_logLauncher, $"MongoDB start skipped: missing executable {mongoExe}");
+            return false;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(mongoData);
+        }
+        catch (Exception ex)
+        {
+            AppendLog(_logLauncher, $"MongoDB start failed: cannot prepare data dir {mongoData} ({ex.Message})");
+            return false;
+        }
+
+        AppendLog(_logLauncher, $"Starting MongoDB: {mongoExe}");
+        StartDetachedProcess(mongoExe, $"--dbpath \"{mongoData}\" --bind_ip 127.0.0.1 --port 27017", DatabaseRootDir(), "MONGODB");
+        var deadline = DateTime.UtcNow.AddSeconds(15);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (IsPortListeningLocal(27017))
+            {
+                AppendLog(_logLauncher, "MongoDB is listening on 127.0.0.1:27017.");
+                return true;
+            }
+            await Task.Delay(500);
+        }
+
+        AppendLog(_logLauncher, "MongoDB did not open port 27017 in time.");
+        return false;
     }
 
     private void AppendLog(RichTextBox box, string line)
@@ -2913,25 +3105,20 @@ public sealed class MainForm : Form
         {
             SetBadge(_lblBot, "Launcher busy: start/restart in progress...", BadgeTone.Neutral);
         }
-        var apiOk = await IsOkAsync($"{ApiBase()}/health");
-        var backtestOk = await IsOkAsync($"{BacktestBase()}/health");
-        var dashOk = await IsOkAsync(DashboardUrl());
-        var botState = await TryGetAsync($"{ApiBase()}/bot/status");
-        if (!apiOk && !string.IsNullOrWhiteSpace(botState))
-        {
-            // /health can transiently fail while API itself is already responding.
-            apiOk = true;
-        }
+        var apiOk = await IsStrictOkAsync($"{ApiBase()}/health");
+        var backtestOk = await IsStrictOkAsync($"{BacktestBase()}/health");
+        var dashOk = await IsStrictOkAsync(DashboardUrl(), timeoutSec: 5);
+        var botState = apiOk ? await TryGetAsync($"{ApiBase()}/bot/status") : null;
         var now = DateTime.UtcNow;
         string? autoTuneLatest = null;
-        if ((now - _lastAutoTuneFetchUtc).TotalSeconds >= AutoTuneFetchSeconds)
+        if (apiOk && (now - _lastAutoTuneFetchUtc).TotalSeconds >= AutoTuneFetchSeconds)
         {
             autoTuneLatest = await TryGetAsync($"{ApiBase()}/bot/config-recommendations/latest");
             _lastAutoTuneFetchUtc = now;
         }
 
         string? shadowReport = null;
-        if ((now - _lastShadowFetchUtc).TotalSeconds >= ShadowFetchSeconds)
+        if (apiOk && (now - _lastShadowFetchUtc).TotalSeconds >= ShadowFetchSeconds)
         {
             var shadowActions = Uri.EscapeDataString(_shadowActionsParam);
             shadowReport = await TryGetAsync($"{ApiBase()}/bot/signal-quality/shadow-report?lookback_hours=24&horizon_min=120&limit=2000&actions={shadowActions}");
@@ -3554,6 +3741,20 @@ public sealed class MainForm : Form
             return true;
         }
         return false;
+    }
+
+    private async Task<bool> IsStrictOkAsync(string url, int timeoutSec = 6)
+    {
+        try
+        {
+            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(Math.Max(1, timeoutSec)));
+            using var res = await _http.GetAsync(url, cts.Token);
+            return res.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static bool TryGetLocalPortFromUrl(string url, out int port)
