@@ -376,6 +376,7 @@ public sealed class MainForm : Form
                             _web.CoreWebView2.Navigate(DashboardUrl());
                             AppendLog(_logLauncher, "Session unlock recovery: dashboard navigate");
                         }
+                        TriggerIbkrGatewayRecoveryFromUnlock();
                         await RefreshHealthAsync();
                     }
                     catch (Exception ex)
@@ -1078,11 +1079,50 @@ public sealed class MainForm : Form
         bool ibkrPortOk,
         bool ibkrProcOk)
     {
-        if (ibkrPortOk || !IsLocalIbkrHost(host) || IsProjectActionLocked())
+        if (ibkrPortOk)
+            return;
+        var reason = ibkrProcOk ? "API port is down" : "gateway process is not running";
+        RequestIbkrGatewayRecovery(envVars, host, configuredPort, tradingMode, reason, forceCooldownBypass: false);
+    }
+
+    private void TriggerIbkrGatewayRecoveryFromUnlock()
+    {
+        try
+        {
+            var envVars = ReadLocalEnvFile();
+            var host = GetConfiguredIbkrHost(envVars);
+            var tradingMode = GetConfiguredIbkrTradingMode(envVars);
+            var configuredPort = GetConfiguredIbkrPort(envVars, tradingMode);
+            var ibkrPortOk = FindListeningIbkrPort(host, configuredPort, tradingMode).HasValue;
+            if (ibkrPortOk)
+            {
+                AppendLog(_logLauncher, $"Session unlock recovery: IBKR API already reachable | host {host} | port {configuredPort} | mode {tradingMode}");
+                return;
+            }
+
+            AppendLog(_logLauncher, $"Session unlock recovery: requesting IBKR Gateway ensure | host {host} | port {configuredPort} | mode {tradingMode}");
+            RequestIbkrGatewayRecovery(envVars, host, configuredPort, tradingMode, "session unlock", forceCooldownBypass: true);
+        }
+        catch (Exception ex)
+        {
+            AppendLog(_logLauncher, $"Session unlock IBKR recovery failed: {ex.Message}");
+        }
+    }
+
+    private void RequestIbkrGatewayRecovery(
+        IReadOnlyDictionary<string, string> envVars,
+        string host,
+        int configuredPort,
+        string tradingMode,
+        string reason,
+        bool forceCooldownBypass)
+    {
+        if (!IsLocalIbkrHost(host) || IsProjectActionLocked())
             return;
         if (Interlocked.CompareExchange(ref _ibkrGatewayEnsureInProgress, 0, 0) == 1)
             return;
-        if ((DateTime.UtcNow - _lastIbkrGatewayEnsureUtc).TotalSeconds < IbkrGatewayRecoveryCooldownSeconds)
+        if (!forceCooldownBypass &&
+            (DateTime.UtcNow - _lastIbkrGatewayEnsureUtc).TotalSeconds < IbkrGatewayRecoveryCooldownSeconds)
             return;
         if (!HasIbkrGatewayCredentials(envVars))
             return;
@@ -1090,7 +1130,6 @@ public sealed class MainForm : Form
             return;
 
         _lastIbkrGatewayEnsureUtc = DateTime.UtcNow;
-        var reason = ibkrProcOk ? "API port is down" : "gateway process is not running";
         AppendLog(_logLauncher, $"IBKR Gateway recovery requested: {reason} | host {host} | port {configuredPort} | mode {tradingMode}");
         _ = RecoverIbkrGatewayAsync(host, configuredPort, tradingMode);
     }

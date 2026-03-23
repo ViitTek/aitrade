@@ -1,6 +1,8 @@
 param(
     [string]$ProjectRoot = "C:\aiinvest",
     [int]$LoginTimeoutSec = 150,
+    [int]$ForegroundRetrySec = 30,
+    [int]$ForegroundStableSec = 25,
     [switch]$SkipCredentialEntry,
     [switch]$SwitchOnly
 )
@@ -186,6 +188,8 @@ function Wait-ForWindow {
         try {
             if ($WindowHandle -ne [IntPtr]::Zero) {
                 [void][NativeFocus]::ShowWindowAsync($WindowHandle, 9)
+                [System.Windows.Forms.SendKeys]::SendWait('%')
+                Start-Sleep -Milliseconds 80
                 if ([NativeFocus]::SetForegroundWindow($WindowHandle)) {
                     return $true
                 }
@@ -193,6 +197,8 @@ function Wait-ForWindow {
         } catch {
         }
         try {
+            [System.Windows.Forms.SendKeys]::SendWait('%')
+            Start-Sleep -Milliseconds 80
             if ($ProcessId -gt 0 -and $Shell.AppActivate($ProcessId)) {
                 return $true
             }
@@ -201,6 +207,8 @@ function Wait-ForWindow {
         foreach ($title in $Titles) {
             if ([string]::IsNullOrWhiteSpace($title)) { continue }
             try {
+                [System.Windows.Forms.SendKeys]::SendWait('%')
+                Start-Sleep -Milliseconds 80
                 if ($Shell.AppActivate($title)) {
                     return $true
                 }
@@ -256,6 +264,37 @@ function Wait-ForForegroundWindow {
         Start-Sleep -Milliseconds 250
     }
     return $false
+}
+
+function Request-ForegroundWindow {
+    param(
+        [System.__ComObject]$Shell,
+        [int]$ProcessId,
+        [IntPtr]$WindowHandle,
+        [string[]]$Titles,
+        [int]$ActivationTimeoutSec = 5
+    )
+
+    if ($WindowHandle -eq [IntPtr]::Zero) {
+        $WindowHandle = Get-ProcessWindowHandle -ProcessId $ProcessId
+    }
+
+    $attempted = $false
+    if ($WindowHandle -ne [IntPtr]::Zero -or $ProcessId -gt 0) {
+        $attempted = Wait-ForWindow -Shell $Shell -ProcessId $ProcessId -WindowHandle $WindowHandle -Titles $Titles -TimeoutSec $ActivationTimeoutSec
+    }
+
+    $WindowHandle = Get-ProcessWindowHandle -ProcessId $ProcessId
+    $isForeground = $false
+    if ($WindowHandle -ne [IntPtr]::Zero -or $ProcessId -gt 0) {
+        $isForeground = Wait-ForForegroundWindow -ProcessId $ProcessId -WindowHandle $WindowHandle -TimeoutSec 2
+    }
+
+    return @{
+        Attempted = $attempted
+        WindowHandle = $WindowHandle
+        IsForeground = $isForeground
+    }
 }
 
 function Get-ProcessWindowHandle {
@@ -686,44 +725,95 @@ if ([string]::IsNullOrWhiteSpace($username) -or [string]::IsNullOrWhiteSpace($pa
 $shell = New-Object -ComObject WScript.Shell
 $deadline = (Get-Date).AddSeconds([Math]::Max(30, $LoginTimeoutSec))
 $attempt = 0
+$activationTitles = @("IBKR Gateway", "IB Gateway", "Login")
+$foregroundRetrySeconds = [Math]::Max(5, $ForegroundRetrySec)
+$foregroundStableSeconds = [Math]::Max(0, $ForegroundStableSec)
+$lastForegroundSwitchUtc = $null
+$nextForegroundRequestUtc = [DateTime]::MinValue
+$foregroundWaitLogged = $false
 
 while ((Get-Date) -lt $deadline) {
+    $now = Get-Date
     $openPort = Get-OpenPort -HostName $hostName -Ports $portCandidates
     if ($null -ne $openPort) {
         Write-Status "gateway login confirmed on port $openPort"
         exit 0
     }
 
-    $attempt++
-    if (-not (Wait-ForForegroundWindow -ProcessId $gatewayPid -WindowHandle $gatewayWindowHandle -TimeoutSec 2)) {
-        Write-Status "login attempt $attempt skipped: gateway window is not foreground"
-    } else {
-        $layout = Get-LoginLayout -Attempt $attempt
-        $switched = Select-IbApiPaperMode -WindowHandle $gatewayWindowHandle -Layout $layout
-        if ($SwitchOnly) {
-            if ($switched) {
-                Write-Status "switch-only attempt $attempt confirmed"
-                exit 0
-            }
-            Write-Status "switch-only attempt $attempt failed"
-        }
-        elseif (Send-LoginKeys -Shell $shell -ProcessId $gatewayPid -WindowHandle $gatewayWindowHandle -Titles @("IBKR Gateway", "IB Gateway", "Login") -Username $username -Password $password -Attempt $attempt) {
-            Write-Status "login attempt $attempt sent"
-        } else {
-            Write-Status "login attempt $attempt skipped: gateway window is not foreground"
-        }
+    if ($gatewayWindowHandle -eq [IntPtr]::Zero -and $gatewayPid -gt 0) {
+        $gatewayWindowHandle = Get-ProcessWindowHandle -ProcessId $gatewayPid
     }
 
-    for ($i = 0; $i -lt 10; $i++) {
-        Start-Sleep -Seconds 2
-        $layout = Get-LoginLayout -Attempt $attempt
-        [void](Try-AcceptPaperTradingWarning -Shell $shell -ProcessId $gatewayPid -WindowHandle $gatewayWindowHandle -Layout $layout)
-        $openPort = Get-OpenPort -HostName $hostName -Ports $portCandidates
-        if ($null -ne $openPort) {
-            Write-Status "gateway login confirmed on port $openPort"
-            exit 0
+    $isForeground = Test-WindowIsForeground -WindowHandle $gatewayWindowHandle -ProcessId $gatewayPid
+    if (-not $isForeground) {
+        $foregroundWaitLogged = $false
+        if ($now -ge $nextForegroundRequestUtc) {
+            $request = Request-ForegroundWindow -Shell $shell -ProcessId $gatewayPid -WindowHandle $gatewayWindowHandle -Titles $activationTitles -ActivationTimeoutSec 5
+            $gatewayWindowHandle = $request.WindowHandle
+            $lastForegroundSwitchUtc = Get-Date
+            $nextForegroundRequestUtc = $lastForegroundSwitchUtc.AddSeconds($foregroundRetrySeconds)
+            if ($request.Attempted) {
+                if ($request.IsForeground) {
+                    Write-Status "gateway window switched to foreground; waiting $foregroundStableSeconds seconds before login"
+                } else {
+                    Write-Status "gateway window focus requested; waiting for foreground"
+                }
+            } else {
+                Write-Status "gateway window focus requested; window handle is not ready yet"
+            }
+        }
+        Start-Sleep -Seconds 1
+        continue
+    }
+
+    if ($null -ne $lastForegroundSwitchUtc) {
+        $stableForSec = ($now - $lastForegroundSwitchUtc).TotalSeconds
+        if ($stableForSec -lt $foregroundStableSeconds) {
+            if (-not $foregroundWaitLogged) {
+                $remaining = [Math]::Ceiling($foregroundStableSeconds - $stableForSec)
+                Write-Status "gateway window is foreground; waiting ${remaining}s before login"
+                $foregroundWaitLogged = $true
+            }
+            Start-Sleep -Seconds 1
+            continue
         }
     }
+    $foregroundWaitLogged = $false
+
+    $attempt++
+    $layout = Get-LoginLayout -Attempt $attempt
+    $switched = Select-IbApiPaperMode -WindowHandle $gatewayWindowHandle -Layout $layout
+    if ($SwitchOnly) {
+        if ($switched) {
+            Write-Status "switch-only attempt $attempt confirmed"
+            exit 0
+        }
+        Write-Status "switch-only attempt $attempt failed"
+        $lastForegroundSwitchUtc = Get-Date
+        $nextForegroundRequestUtc = $lastForegroundSwitchUtc.AddSeconds($foregroundRetrySeconds)
+        Start-Sleep -Seconds 1
+        continue
+    }
+
+    if (Send-LoginKeys -Shell $shell -ProcessId $gatewayPid -WindowHandle $gatewayWindowHandle -Titles $activationTitles -Username $username -Password $password -Attempt $attempt) {
+        Write-Status "login attempt $attempt sent"
+        for ($i = 0; $i -lt 10; $i++) {
+            Start-Sleep -Seconds 2
+            $layout = Get-LoginLayout -Attempt $attempt
+            [void](Try-AcceptPaperTradingWarning -Shell $shell -ProcessId $gatewayPid -WindowHandle $gatewayWindowHandle -Layout $layout)
+            $openPort = Get-OpenPort -HostName $hostName -Ports $portCandidates
+            if ($null -ne $openPort) {
+                Write-Status "gateway login confirmed on port $openPort"
+                exit 0
+            }
+        }
+    } else {
+        Write-Status "login attempt $attempt deferred: gateway window lost foreground"
+    }
+
+    $lastForegroundSwitchUtc = Get-Date
+    $nextForegroundRequestUtc = $lastForegroundSwitchUtc.AddSeconds($foregroundRetrySeconds)
+    Start-Sleep -Seconds 1
 }
 
 Write-Status "gateway ensure timed out after $LoginTimeoutSec seconds"

@@ -29,6 +29,22 @@ STOOQ_MAP: Dict[str, str] = {
     "FTSE": "^ukx",
 }
 
+YF_MAP: Dict[str, str] = {
+    "EURUSD": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X",
+    "USDJPY": "USDJPY=X",
+    "AUDUSD": "AUDUSD=X",
+    "XAUUSD": "GC=F",
+    "XAGUSD": "SI=F",
+    "CL": "CL=F",
+    "WTI": "CL=F",
+    "BRENT": "BZ=F",
+    "SPX": "^GSPC",
+    "NDX": "^NDX",
+    "DAX": "^GDAXI",
+    "FTSE": "^FTSE",
+}
+
 
 def _parse_list(src: str) -> List[str]:
     return [x.strip().upper() for x in str(src or "").split(",") if x.strip()]
@@ -58,7 +74,10 @@ def _fetch_stooq(symbol: str) -> Tuple[datetime, float, float, float, float, flo
         raise ValueError(f"unsupported symbol mapping: {symbol}")
     r = requests.get(_stooq_url(ticker), timeout=20)
     r.raise_for_status()
-    lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
+    body = (r.text or "").strip()
+    if "Exceeded the daily hits limit" in body:
+        raise ValueError("stooq daily hits limit exceeded")
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
     if len(lines) < 2:
         raise ValueError(f"no data rows for {symbol}")
     cols = [x.strip() for x in lines[1].split(",")]
@@ -70,6 +89,48 @@ def _fetch_stooq(symbol: str) -> Tuple[datetime, float, float, float, float, flo
     v = float(cols[7]) if len(cols) > 7 and cols[7] else 0.0
     ts = datetime.now(timezone.utc).replace(second=0, microsecond=0)
     return ts, o, h, l, c, v
+
+
+def _fetch_yahoo(symbol: str) -> Tuple[datetime, float, float, float, float, float]:
+    ticker = YF_MAP.get(symbol.upper())
+    if not ticker:
+        raise ValueError(f"unsupported yahoo mapping: {symbol}")
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+    params = {
+        "range": "5d",
+        "interval": "60m",
+        "includePrePost": "false",
+        "events": "history",
+    }
+    r = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+    r.raise_for_status()
+    root = r.json().get("chart", {}).get("result", [])
+    if not root:
+        raise ValueError(f"no yahoo result rows for {symbol}")
+    chart = root[0]
+    ts = chart.get("timestamp") or []
+    quotes = ((chart.get("indicators") or {}).get("quote") or [{}])[0]
+    opens = quotes.get("open") or []
+    highs = quotes.get("high") or []
+    lows = quotes.get("low") or []
+    closes = quotes.get("close") or []
+    vols = quotes.get("volume") or []
+
+    rows = []
+    n = min(len(ts), len(opens), len(highs), len(lows), len(closes))
+    for i in range(n):
+        o = opens[i]
+        h = highs[i]
+        l = lows[i]
+        c = closes[i]
+        if o is None or h is None or l is None or c is None:
+            continue
+        dt = datetime.fromtimestamp(int(ts[i]), tz=timezone.utc).replace(minute=0, second=0, microsecond=0)
+        v = float(vols[i]) if i < len(vols) and vols[i] is not None else 0.0
+        rows.append((dt, float(o), float(h), float(l), float(c), v))
+    if not rows:
+        raise ValueError(f"no yahoo data rows for {symbol}")
+    return rows[-1]
 
 
 def _contract_candidates(symbol: str):
@@ -172,6 +233,52 @@ def _fetch_ibkr(ib: IB, symbol: str) -> Tuple[datetime, float, float, float, flo
     return ts, float(bar.open), float(bar.high), float(bar.low), float(bar.close), float(getattr(bar, "volume", 0.0) or 0.0)
 
 
+def _connect_ibkr_shadow() -> IB:
+    ib = IB()
+    host = str(getattr(settings, "IBKR_TWS_HOST", "127.0.0.1") or "127.0.0.1").strip()
+    port = int(getattr(settings, "IBKR_TWS_PORT", 7497) or 7497)
+    client_id = int(getattr(settings, "IBKR_CLIENT_ID", 77) or 77) + 200
+    connect_ibkr_with_fallback(
+        ib,
+        host=host,
+        configured_port=port,
+        client_id=client_id,
+        readonly=True,
+        timeout_sec=15,
+        trading_mode=normalize_gateway_trading_mode(getattr(settings, "IBKR_GATEWAY_TRADING_MODE", "paper")),
+    )
+    return ib
+
+
+def _fetch_with_fallback(symbol: str, primary_provider: str, ib: IB | None) -> Tuple[str, datetime, float, float, float, float, float]:
+    if primary_provider == "stooq":
+        providers = ["stooq", "yahoo"]
+    elif primary_provider == "yahoo":
+        providers = ["yahoo"]
+    elif primary_provider == "ibkr":
+        providers = ["ibkr", "yahoo"]
+    else:
+        providers = [primary_provider]
+
+    errors: List[str] = []
+    for provider in providers:
+        try:
+            if provider == "stooq":
+                ts, o, h, l, c, v = _fetch_stooq(symbol)
+            elif provider == "yahoo":
+                ts, o, h, l, c, v = _fetch_yahoo(symbol)
+            elif provider == "ibkr":
+                if ib is None or not ib.isConnected():
+                    raise ValueError("ibkr not connected")
+                ts, o, h, l, c, v = _fetch_ibkr(ib, symbol)
+            else:
+                raise ValueError(f"provider not implemented in shadow worker: {provider}")
+            return provider, ts, o, h, l, c, v
+        except Exception as e:
+            errors.append(f"{provider}: {e}")
+    raise ValueError("; ".join(errors))
+
+
 def run_once() -> Dict[str, int]:
     db = get_db()
     provider = (settings.CROSS_ASSET_PROVIDER or "stooq").strip().lower()
@@ -189,42 +296,27 @@ def run_once() -> Dict[str, int]:
     now = datetime.now(timezone.utc)
     try:
         if provider == "ibkr":
-            ib = IB()
-            host = str(getattr(settings, "IBKR_TWS_HOST", "127.0.0.1") or "127.0.0.1").strip()
-            port = int(getattr(settings, "IBKR_TWS_PORT", 7497) or 7497)
-            client_id = int(getattr(settings, "IBKR_CLIENT_ID", 77) or 77) + 200
-            connect_ibkr_with_fallback(
-                ib,
-                host=host,
-                configured_port=port,
-                client_id=client_id,
-                readonly=True,
-                timeout_sec=15,
-                trading_mode=normalize_gateway_trading_mode(getattr(settings, "IBKR_GATEWAY_TRADING_MODE", "paper")),
-            )
+            ib = _connect_ibkr_shadow()
+        elif provider not in {"stooq", "yahoo"}:
+            raise ValueError(f"unsupported cross-asset provider: {provider}")
 
         for sym in symbols:
             try:
-                if provider == "stooq":
-                    ts, o, h, l, c, v = _fetch_stooq(sym)
-                elif provider == "ibkr":
-                    ts, o, h, l, c, v = _fetch_ibkr(ib, sym)
-                else:
-                    raise ValueError(f"provider not implemented in shadow worker: {provider}")
+                actual_provider, ts, o, h, l, c, v = _fetch_with_fallback(sym, provider, ib)
                 doc = {
                     "symbol": sym,
                     "asset_class": _bucket(sym),
-                    "provider": provider,
+                    "provider": actual_provider,
                     "timestamp": ts,
                     "o": o,
                     "h": h,
                     "l": l,
                     "c": c,
                     "v": v,
-                    "source": "cross_asset_shadow_worker",
+                    "source": f"cross_asset_shadow_worker:{provider}",
                 }
                 db.cross_asset_candles.update_one(
-                    {"symbol": sym, "provider": provider, "timestamp": ts},
+                    {"symbol": sym, "provider": actual_provider, "timestamp": ts},
                     {"$set": doc},
                     upsert=True,
                 )
