@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(code --list-extensions)",
+      "Bash(grep -E \"\\\\.\\(py|json|env|yaml|yml|conf|txt\\)$\")",
+      "Bash(iconv -f UTF-16LE -t UTF-8 c:aiinvestRPRTS_shadow_testsweekly-suite-20260319-220522ibkrrun.log)",
+      "Bash(powershell -Command \"Get-Content ''c:\\\\aiinvest\\\\RPRTS\\\\_shadow_tests\\\\weekly-suite-20260319-220522\\\\ibkr\\\\run.log'' | Select-Object -First 50\")",
+      "Bash(find /c/aiinvest/PRJCT/python-core -maxdepth 1 -type f -name \"*.py\" -exec wc -l {} +)",
+      "Bash(powershell -Command \"Get-Content ''c:\\\\aiinvest\\\\RPRTS\\\\_shadow_tests\\\\weekly-suite-20260319-220522\\\\ibkr\\\\run.log'' | Select-Object -Last 50\")",
+      "Bash(powershell -Command \"Get-Content ''c:\\\\aiinvest\\\\RPRTS\\\\_shadow_tests\\\\weekly-suite-20260319-220522\\\\ibkr\\\\watchdog.log'' | Select-Object -First 50\")",
+      "Bash(powershell -Command \"Get-Content ''c:\\\\aiinvest\\\\RPRTS\\\\_shadow_tests\\\\weekly-suite-20260319-220522\\\\ibkr\\\\watchdog.log'' | Select-Object -Last 50\")",
+      "Bash(powershell -Command \"Get-Content ''c:\\\\aiinvest\\\\RPRTS\\\\_shadow_tests\\\\weekly-suite-20260319-220522\\\\ibkr\\\\metrics.jsonl'' -Head 10\")",
+      "Bash(powershell -Command \"Get-Content ''c:\\\\aiinvest\\\\RPRTS\\\\_shadow_tests\\\\weekly-suite-20260319-220522\\\\ibkr\\\\metrics.jsonl'' -Tail 10\")",
+      "Bash(powershell -Command \"Get-Content ''c:\\\\aiinvest\\\\RPRTS\\\\_shadow-reports\\\\ibkr\\\\report_all_h_ibkr_4c26c6d2174a_20260326_221856.md'' | Select-Object -First 80\")",
+      "Bash(python -c \":*)",
+      "Bash(1 ls:*)"
+    ]
+  }
+}

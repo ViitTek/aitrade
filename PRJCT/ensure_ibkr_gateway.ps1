@@ -15,6 +15,7 @@ Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public static class NativeFocus
 {
@@ -25,6 +26,13 @@ public static class NativeFocus
         public int Top;
         public int Right;
         public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT
+    {
+        public int X;
+        public int Y;
     }
 
     [DllImport("user32.dll")]
@@ -47,6 +55,21 @@ public static class NativeFocus
 
     [DllImport("user32.dll")]
     public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+
+    [DllImport("user32.dll")]
+    public static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool CloseDesktop(IntPtr hDesktop);
+
+    [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, StringBuilder pvInfo, int nLength, ref int lpnLengthNeeded);
 }
 "@
 
@@ -146,9 +169,32 @@ function Get-OpenPort {
 }
 
 function Get-GatewayProcesses {
-    return @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
+    $result = New-Object System.Collections.Generic.List[object]
+    $seen = New-Object System.Collections.Generic.HashSet[int]
+
+    $native = @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
         $_.ProcessName -match "^(ibgateway|tws)$"
     } | Sort-Object StartTime -Descending)
+    foreach ($proc in $native) {
+        if ($seen.Add([int]$proc.Id)) {
+            [void]$result.Add($proc)
+        }
+    }
+
+    $javaGateway = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match '^javaw?\.exe$' -and [string]$_.CommandLine -match 'ibcalpha\.ibc\.IbcGateway'
+    })
+    foreach ($procInfo in $javaGateway) {
+        try {
+            $proc = Get-Process -Id ([int]$procInfo.ProcessId) -ErrorAction Stop
+            if ($seen.Add([int]$proc.Id)) {
+                [void]$result.Add($proc)
+            }
+        } catch {
+        }
+    }
+
+    return @($result | Sort-Object StartTime -Descending)
 }
 
 function Find-GatewayExecutable {
@@ -165,7 +211,8 @@ function Find-GatewayExecutable {
     $roots = @("C:\Jts\ibgateway", "C:\Jts")
     foreach ($root in $roots) {
         if (-not (Test-Path $root)) { continue }
-        $match = Get-ChildItem $root -Filter "ibgateway.exe" -Recurse -ErrorAction SilentlyContinue |
+        $match = Get-ChildItem $root -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -in @("ibgateway.exe", "ibgateway1.exe") } |
             Sort-Object FullName -Descending |
             Select-Object -First 1
         if ($match) {
@@ -173,6 +220,321 @@ function Find-GatewayExecutable {
         }
     }
     return $null
+}
+
+function Stop-GatewayProcesses {
+    param([int]$WaitMs = 15000)
+
+    $running = @(Get-GatewayProcesses)
+    foreach ($proc in $running) {
+        try {
+            Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+            Write-Status "stopped existing gateway process (pid $($proc.Id))"
+        } catch {
+            Write-Status "failed to stop gateway process pid $($proc.Id): $($_.Exception.Message)"
+        }
+    }
+
+    if ($running.Count -eq 0) {
+        return
+    }
+
+    $deadline = (Get-Date).AddMilliseconds([Math]::Max(1000, $WaitMs))
+    while ((Get-Date) -lt $deadline) {
+        if ((Get-GatewayProcesses).Count -eq 0) {
+            return
+        }
+        Start-Sleep -Milliseconds 300
+    }
+}
+
+function Find-IbcRoot {
+    param([hashtable]$EnvVars)
+
+    $candidates = @(
+        (Get-FirstEnvValue -Values $EnvVars -Names @("IBKR_IBC_PATH", "IBC_PATH")),
+        "C:\IBC"
+    )
+
+    foreach ($candidate in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        $root = $candidate.Trim()
+        $startScript = Join-Path $root "scripts\StartIBC.bat"
+        if (Test-Path $startScript) {
+            return $root
+        }
+    }
+    return $null
+}
+
+function Get-GatewayMajorVersion {
+    param([string]$GatewayExecutable)
+
+    if (-not [string]::IsNullOrWhiteSpace($GatewayExecutable)) {
+        $folderName = Split-Path -Leaf (Split-Path -Parent $GatewayExecutable)
+        if ($folderName -match '^\d+$') {
+            return [int]$folderName
+        }
+    }
+
+    $root = "C:\Jts\ibgateway"
+    if (Test-Path $root) {
+        $match = Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^\d+$' } |
+            Sort-Object Name -Descending |
+            Select-Object -First 1
+        if ($match) {
+            return [int]$match.Name
+        }
+    }
+    return $null
+}
+
+function New-IbcConfigContent {
+    param(
+        [string]$Username,
+        [string]$Password,
+        [string]$TradingMode,
+        [int]$ApiPort
+    )
+
+    return @(
+        "# Generated by ensure_ibkr_gateway.ps1",
+        "# This file is recreated from PRJCT/python-core/.env during recovery.",
+        "FIX=no",
+        "",
+        "IbLoginId=$Username",
+        "IbPassword=$Password",
+        "TradingMode=$TradingMode",
+        "AcceptNonBrokerageAccountWarning=yes",
+        "LoginDialogDisplayTimeout=60",
+        "OverrideTwsApiPort=$ApiPort",
+        "ReadOnlyLogin=no",
+        "ReloginAfterSecondFactorAuthenticationTimeout=yes",
+        "SecondFactorAuthenticationExitInterval=60",
+        "SecondFactorAuthenticationTimeout=180",
+        ""
+    )
+}
+
+function Ensure-IbcRuntimeConfig {
+    param(
+        [string]$ProjectDir,
+        [string]$Username,
+        [string]$Password,
+        [string]$TradingMode,
+        [int]$ApiPort
+    )
+
+    $runtimeDir = Join-Path $ProjectDir "_runtime\ibc"
+    if (-not (Test-Path $runtimeDir)) {
+        New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+    }
+
+    $configPath = Join-Path $runtimeDir "config.ini"
+    $content = New-IbcConfigContent -Username $Username -Password $Password -TradingMode $TradingMode -ApiPort $ApiPort
+    Set-Content -Path $configPath -Value $content -Encoding ASCII
+    return $configPath
+}
+
+function Ensure-IbcRuntimeArtifacts {
+    param(
+        [string]$ProjectDir
+    )
+
+    $runtimeDir = Join-Path $ProjectDir "_runtime\ibc"
+    $logDir = Join-Path $runtimeDir "Logs"
+    if (-not (Test-Path $runtimeDir)) {
+        New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null
+    }
+    if (-not (Test-Path $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+    }
+
+    return @{
+        RuntimeDir = $runtimeDir
+        LogDir = $logDir
+    }
+}
+
+function Get-IbcProgramPath {
+    param(
+        [int]$GatewayMajorVersion
+    )
+
+    $candidates = @(
+        "C:\Jts\ibgateway\$GatewayMajorVersion",
+        "C:\Jts\$GatewayMajorVersion"
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path (Join-Path $candidate "jars")) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+function Resolve-IbcJavaExe {
+    param([string]$ProgramPath)
+
+    $install4jPath = Join-Path $ProgramPath ".install4j"
+    foreach ($cfgName in @("pref_jre.cfg", "inst_jre.cfg")) {
+        $cfgPath = Join-Path $install4jPath $cfgName
+        if (-not (Test-Path $cfgPath)) { continue }
+
+        $basePath = ((Get-Content $cfgPath -ErrorAction SilentlyContinue | Select-Object -First 1) -as [string])
+        if ([string]::IsNullOrWhiteSpace($basePath)) { continue }
+        $javaExe = Join-Path ($basePath.Trim()) "bin\java.exe"
+        if (Test-Path $javaExe) {
+            return $javaExe
+        }
+    }
+
+    $oracleJava = Join-Path $env:ProgramData "Oracle\Java\javapath\java.exe"
+    if (Test-Path $oracleJava) {
+        return $oracleJava
+    }
+
+    $javaCommand = Get-Command java.exe -ErrorAction SilentlyContinue
+    if ($javaCommand -and -not [string]::IsNullOrWhiteSpace($javaCommand.Source)) {
+        return $javaCommand.Source
+    }
+
+    return $null
+}
+
+function Get-IbcClasspath {
+    param(
+        [string]$ProgramPath,
+        [string]$IbcRoot
+    )
+
+    $jarsPath = Join-Path $ProgramPath "jars"
+    $jarFiles = @(Get-ChildItem $jarsPath -Filter "*.jar" -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object { $_.FullName })
+    if ($jarFiles.Count -eq 0) {
+        return $null
+    }
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($jarFile in $jarFiles) {
+        $parts.Add($jarFile)
+    }
+    $parts.Add((Join-Path $ProgramPath ".install4j\i4jruntime.jar"))
+    $parts.Add((Join-Path $IbcRoot "IBC.jar"))
+    return [string]::Join(';', $parts)
+}
+
+function Get-IbcVmOptions {
+    param(
+        [string]$ProgramPath,
+        [string]$SettingsPath
+    )
+
+    $vmOptionsPath = Join-Path $ProgramPath "ibgateway.vmoptions"
+    if (-not (Test-Path $vmOptionsPath)) {
+        return @()
+    }
+
+    $options = New-Object System.Collections.Generic.List[string]
+    foreach ($line in Get-Content $vmOptionsPath -ErrorAction SilentlyContinue) {
+        $text = if ($null -eq $line) { "" } else { [string]$line }
+        $text = $text.Trim()
+        if ([string]::IsNullOrWhiteSpace($text) -or $text.StartsWith("#")) { continue }
+        $options.Add($text)
+    }
+
+    $options.Add("-Dtwslaunch.autoupdate.serviceImpl=com.ib.tws.twslaunch.install4j.Install4jAutoUpdateService")
+    $options.Add("-Dchannel=latest")
+    $options.Add("-Dexe4j.isInstall4j=true")
+    $options.Add("-Dinstall4jType=standalone")
+    $options.Add("-DjtsConfigDir=$SettingsPath")
+    $options.Add("-Dibcsessionid=$([int](Get-Random -Minimum 100000000 -Maximum 999999999))")
+
+    return @($options)
+}
+
+function Get-IbcModuleAccessArgs {
+    return @(
+        "--add-opens=java.base/java.util=ALL-UNNAMED",
+        "--add-opens=java.base/java.util.concurrent=ALL-UNNAMED",
+        "--add-exports=java.base/sun.util=ALL-UNNAMED",
+        "--add-exports=java.desktop/com.sun.java.swing.plaf.motif=ALL-UNNAMED",
+        "--add-opens=java.desktop/java.awt=ALL-UNNAMED",
+        "--add-opens=java.desktop/java.awt.dnd=ALL-UNNAMED",
+        "--add-opens=java.desktop/javax.swing=ALL-UNNAMED",
+        "--add-opens=java.desktop/javax.swing.event=ALL-UNNAMED",
+        "--add-opens=java.desktop/javax.swing.plaf.basic=ALL-UNNAMED",
+        "--add-opens=java.desktop/javax.swing.table=ALL-UNNAMED",
+        "--add-opens=java.desktop/sun.awt=ALL-UNNAMED",
+        "--add-exports=java.desktop/sun.swing=ALL-UNNAMED",
+        "--add-opens=javafx.graphics/com.sun.javafx.application=ALL-UNNAMED",
+        "--add-exports=javafx.media/com.sun.media.jfxmedia=ALL-UNNAMED",
+        "--add-exports=javafx.media/com.sun.media.jfxmedia.events=ALL-UNNAMED",
+        "--add-exports=javafx.media/com.sun.media.jfxmedia.locator=ALL-UNNAMED",
+        "--add-exports=javafx.media/com.sun.media.jfxmediaimpl=ALL-UNNAMED",
+        "--add-exports=javafx.web/com.sun.javafx.webkit=ALL-UNNAMED",
+        "--add-opens=jdk.management/com.sun.management.internal=ALL-UNNAMED"
+    )
+}
+
+function Start-GatewayViaIbc {
+    param(
+        [string]$ProjectDir,
+        [string]$IbcRoot,
+        [int]$GatewayMajorVersion,
+        [string]$ConfigPath,
+        [string]$TradingMode
+    )
+
+    $programPath = Get-IbcProgramPath -GatewayMajorVersion $GatewayMajorVersion
+    if ([string]::IsNullOrWhiteSpace($programPath)) {
+        throw "IBC program path for gateway version $GatewayMajorVersion was not found."
+    }
+
+    $javaExe = Resolve-IbcJavaExe -ProgramPath $programPath
+    if ([string]::IsNullOrWhiteSpace($javaExe) -or -not (Test-Path $javaExe)) {
+        throw "Java runtime for IBC gateway launch was not found."
+    }
+
+    $artifacts = Ensure-IbcRuntimeArtifacts -ProjectDir $ProjectDir
+    $classpath = Get-IbcClasspath -ProgramPath $programPath -IbcRoot $IbcRoot
+    if ([string]::IsNullOrWhiteSpace($classpath)) {
+        throw "IBC classpath could not be constructed."
+    }
+
+    $settingsPath = $programPath
+    $vmOptions = @(Get-IbcVmOptions -ProgramPath $programPath -SettingsPath $settingsPath)
+    $moduleArgs = @(Get-IbcModuleAccessArgs)
+    $stdoutPath = Join-Path $artifacts.LogDir "ibc-java-stdout.log"
+    $stderrPath = Join-Path $artifacts.LogDir "ibc-java-stderr.log"
+
+    $arguments = New-Object System.Collections.Generic.List[string]
+    foreach ($arg in $moduleArgs) { $arguments.Add($arg) }
+    foreach ($arg in $vmOptions) { $arguments.Add($arg) }
+    $arguments.Add("-cp")
+    $arguments.Add($classpath)
+    $arguments.Add("ibcalpha.ibc.IbcGateway")
+    $arguments.Add($ConfigPath)
+    $arguments.Add($TradingMode)
+
+    $originalJavaToolOptions = $env:JAVA_TOOL_OPTIONS
+    $env:JAVA_TOOL_OPTIONS = ""
+    try {
+        $proc = Start-Process -FilePath $javaExe -ArgumentList @($arguments) -WorkingDirectory $settingsPath -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -PassThru
+    } finally {
+        $env:JAVA_TOOL_OPTIONS = $originalJavaToolOptions
+    }
+
+    return @{
+        Process = $proc
+        LogDir = $artifacts.LogDir
+        ProgramPath = $programPath
+        SettingsPath = $settingsPath
+        JavaExe = $javaExe
+        StdoutPath = $stdoutPath
+        StderrPath = $stderrPath
+    }
 }
 
 function Wait-ForWindow {
@@ -266,6 +628,48 @@ function Wait-ForForegroundWindow {
     return $false
 }
 
+function Get-DesktopState {
+    $desktopHandle = [IntPtr]::Zero
+    $desktopName = ""
+
+    try {
+        $desktopHandle = [NativeFocus]::OpenInputDesktop(0, $false, 0x0001)
+        if ($desktopHandle -ne [IntPtr]::Zero) {
+            $needed = 0
+            $buffer = New-Object System.Text.StringBuilder 256
+            if (-not [NativeFocus]::GetUserObjectInformation($desktopHandle, 2, $buffer, $buffer.Capacity, [ref]$needed) -and $needed -gt $buffer.Capacity) {
+                $buffer = New-Object System.Text.StringBuilder ($needed + 1)
+                [void][NativeFocus]::GetUserObjectInformation($desktopHandle, 2, $buffer, $buffer.Capacity, [ref]$needed)
+            }
+            $desktopName = $buffer.ToString().Trim()
+        }
+    } catch {
+    } finally {
+        if ($desktopHandle -ne [IntPtr]::Zero) {
+            try { [void][NativeFocus]::CloseDesktop($desktopHandle) } catch { }
+        }
+    }
+
+    $isLocked = $false
+    if (-not [string]::IsNullOrWhiteSpace($desktopName)) {
+        $isLocked = -not [string]::Equals($desktopName, "Default", [System.StringComparison]::OrdinalIgnoreCase)
+    } else {
+        $isLocked = @(Get-Process -Name "LogonUI" -ErrorAction SilentlyContinue).Count -gt 0
+        if ($isLocked) {
+            $desktopName = "LogonUI"
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($desktopName)) {
+        $desktopName = "unknown"
+    }
+
+    return @{
+        DesktopName = $desktopName
+        IsLocked = $isLocked
+    }
+}
+
 function Request-ForegroundWindow {
     param(
         [System.__ComObject]$Shell,
@@ -331,7 +735,41 @@ function Get-WindowRect {
     }
 }
 
-function Invoke-WindowClick {
+function Convert-ScreenToClientPoint {
+    param(
+        [IntPtr]$WindowHandle,
+        [int]$ScreenX,
+        [int]$ScreenY
+    )
+
+    if ($WindowHandle -eq [IntPtr]::Zero) {
+        return $null
+    }
+
+    $point = New-Object NativeFocus+POINT
+    $point.X = $ScreenX
+    $point.Y = $ScreenY
+    if (-not [NativeFocus]::ScreenToClient($WindowHandle, [ref]$point)) {
+        return $null
+    }
+
+    return @{
+        X = [int]$point.X
+        Y = [int]$point.Y
+    }
+}
+
+function New-LParamFromPoint {
+    param(
+        [int]$X,
+        [int]$Y
+    )
+
+    $value = (($Y -band 0xFFFF) -shl 16) -bor ($X -band 0xFFFF)
+    return [IntPtr]$value
+}
+
+function Invoke-DirectWindowClick {
     param(
         [IntPtr]$WindowHandle,
         [double]$RelativeX,
@@ -343,8 +781,89 @@ function Invoke-WindowClick {
     if ($null -eq $rect) {
         return $false
     }
-    if (-not (Test-WindowIsForeground -WindowHandle $WindowHandle -ProcessId 0)) {
+
+    $screenX = [int]($rect.Left + ($rect.Width * $RelativeX))
+    $screenY = [int]($rect.Top + ($rect.Height * $RelativeY))
+    $clientPoint = Convert-ScreenToClientPoint -WindowHandle $WindowHandle -ScreenX $screenX -ScreenY $screenY
+    if ($null -eq $clientPoint) {
         return $false
+    }
+
+    $lParam = New-LParamFromPoint -X $clientPoint.X -Y $clientPoint.Y
+    foreach ($idx in 1..([Math]::Max(1, $Clicks))) {
+        [void][NativeFocus]::PostMessage($WindowHandle, 0x0200, [IntPtr]::Zero, $lParam)
+        Start-Sleep -Milliseconds 60
+        [void][NativeFocus]::PostMessage($WindowHandle, 0x0201, [IntPtr]1, $lParam)
+        Start-Sleep -Milliseconds 70
+        [void][NativeFocus]::PostMessage($WindowHandle, 0x0202, [IntPtr]::Zero, $lParam)
+        if ($idx -lt $Clicks) {
+            Start-Sleep -Milliseconds 120
+        }
+    }
+    Start-Sleep -Milliseconds 220
+    return $true
+}
+
+function Send-WindowVirtualKey {
+    param(
+        [IntPtr]$WindowHandle,
+        [int]$VirtualKey,
+        [int]$CharCode = 0
+    )
+
+    if ($WindowHandle -eq [IntPtr]::Zero) {
+        return $false
+    }
+
+    [void][NativeFocus]::PostMessage($WindowHandle, 0x0100, [IntPtr]$VirtualKey, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 35
+    if ($CharCode -gt 0) {
+        [void][NativeFocus]::PostMessage($WindowHandle, 0x0102, [IntPtr]$CharCode, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 35
+    }
+    [void][NativeFocus]::PostMessage($WindowHandle, 0x0101, [IntPtr]$VirtualKey, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 70
+    return $true
+}
+
+function Send-WindowText {
+    param(
+        [IntPtr]$WindowHandle,
+        [string]$Text
+    )
+
+    if ($WindowHandle -eq [IntPtr]::Zero) {
+        return $false
+    }
+
+    $value = if ($null -eq $Text) { "" } else { [string]$Text }
+    foreach ($char in $value.ToCharArray()) {
+        [void][NativeFocus]::PostMessage($WindowHandle, 0x0102, [IntPtr][int][char]$char, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 25
+    }
+    Start-Sleep -Milliseconds 160
+    return $true
+}
+
+function Invoke-WindowClick {
+    param(
+        [IntPtr]$WindowHandle,
+        [double]$RelativeX,
+        [double]$RelativeY,
+        [int]$Clicks = 1,
+        [switch]$SkipForegroundCheck
+    )
+
+    $rect = Get-WindowRect -WindowHandle $WindowHandle
+    if ($null -eq $rect) {
+        return $false
+    }
+    if (-not $SkipForegroundCheck -and -not (Test-WindowIsForeground -WindowHandle $WindowHandle -ProcessId 0)) {
+        return $false
+    }
+
+    if ($SkipForegroundCheck) {
+        return Invoke-DirectWindowClick -WindowHandle $WindowHandle -RelativeX $RelativeX -RelativeY $RelativeY -Clicks $Clicks
     }
 
     $x = [int]($rect.Left + ($rect.Width * $RelativeX))
@@ -394,7 +913,19 @@ function Get-SendKeysLiteral {
 }
 
 function Paste-IntoFocusedField {
-    param([string]$Text)
+    param(
+        [string]$Text,
+        [IntPtr]$WindowHandle = [IntPtr]::Zero,
+        [switch]$DirectInput
+    )
+
+    if ($DirectInput -and $WindowHandle -ne [IntPtr]::Zero) {
+        for ($idx = 0; $idx -lt 80; $idx++) {
+            [void](Send-WindowVirtualKey -WindowHandle $WindowHandle -VirtualKey 0x08 -CharCode 0x08)
+        }
+        return (Send-WindowText -WindowHandle $WindowHandle -Text $Text)
+    }
+
     $value = if ($null -eq $Text) { "" } else { [string]$Text }
     [System.Windows.Forms.SendKeys]::SendWait("^a")
     Start-Sleep -Milliseconds 90
@@ -495,7 +1026,8 @@ function Try-SelectToggle {
         [IntPtr]$WindowHandle,
         [double]$BaseX,
         [double]$BaseY,
-        [scriptblock]$Verifier
+        [scriptblock]$Verifier,
+        [switch]$SkipForegroundCheck
     )
 
     $xOffsets = @(0.00, -0.03, 0.03, -0.05, 0.05, -0.07, 0.07)
@@ -504,7 +1036,7 @@ function Try-SelectToggle {
         foreach ($xOffset in $xOffsets) {
             $targetX = [Math]::Min(0.95, [Math]::Max(0.05, $BaseX + $xOffset))
             $targetY = [Math]::Min(0.95, [Math]::Max(0.05, $BaseY + $yOffset))
-            [void](Invoke-WindowClick -WindowHandle $WindowHandle -RelativeX $targetX -RelativeY $targetY -Clicks 2)
+            [void](Invoke-WindowClick -WindowHandle $WindowHandle -RelativeX $targetX -RelativeY $targetY -Clicks 2 -SkipForegroundCheck:$SkipForegroundCheck)
             Start-Sleep -Milliseconds 420
             if (& $Verifier) {
                 return $true
@@ -535,7 +1067,8 @@ function Try-AcceptPaperTradingWarning {
         [System.__ComObject]$Shell,
         [int]$ProcessId,
         [IntPtr]$WindowHandle,
-        [hashtable]$Layout
+        [hashtable]$Layout,
+        [switch]$SkipForegroundCheck
     )
 
     if ($WindowHandle -eq [IntPtr]::Zero) {
@@ -544,16 +1077,21 @@ function Try-AcceptPaperTradingWarning {
     if ($WindowHandle -eq [IntPtr]::Zero) {
         return $false
     }
-    if (-not (Wait-ForForegroundWindow -ProcessId $ProcessId -WindowHandle $WindowHandle -TimeoutSec 2)) {
+    if (-not $SkipForegroundCheck -and -not (Wait-ForForegroundWindow -ProcessId $ProcessId -WindowHandle $WindowHandle -TimeoutSec 2)) {
         return $false
     }
 
     foreach ($offset in @(0.00, -0.02, 0.02)) {
-        [void](Invoke-WindowClick -WindowHandle $WindowHandle -RelativeX $Layout.AcceptX -RelativeY ($Layout.AcceptY + $offset) -Clicks 2)
+        [void](Invoke-WindowClick -WindowHandle $WindowHandle -RelativeX $Layout.AcceptX -RelativeY ($Layout.AcceptY + $offset) -Clicks 2 -SkipForegroundCheck:$SkipForegroundCheck)
         Start-Sleep -Milliseconds 220
-        [System.Windows.Forms.SendKeys]::SendWait(" ")
-        Start-Sleep -Milliseconds 150
-        [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+        if ($SkipForegroundCheck) {
+            [void](Send-WindowVirtualKey -WindowHandle $WindowHandle -VirtualKey 0x20 -CharCode 0x20)
+            [void](Send-WindowVirtualKey -WindowHandle $WindowHandle -VirtualKey 0x0D -CharCode 0x0D)
+        } else {
+            [System.Windows.Forms.SendKeys]::SendWait(" ")
+            Start-Sleep -Milliseconds 150
+            [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+        }
         Start-Sleep -Milliseconds 500
     }
     return $true
@@ -562,7 +1100,8 @@ function Try-AcceptPaperTradingWarning {
 function Try-AcceptPaperTradingWarningIfPresent {
     param(
         [int]$ProcessId,
-        [IntPtr]$WindowHandle
+        [IntPtr]$WindowHandle,
+        [switch]$SkipForegroundCheck
     )
 
     if ($ProcessId -le 0 -and $WindowHandle -eq [IntPtr]::Zero) {
@@ -573,7 +1112,7 @@ function Try-AcceptPaperTradingWarningIfPresent {
     $layout = Get-LoginLayout -Attempt 1
     $accepted = $false
     foreach ($waitSeconds in @(1, 2, 2, 3)) {
-        if (Try-AcceptPaperTradingWarning -Shell $shell -ProcessId $ProcessId -WindowHandle $WindowHandle -Layout $layout) {
+        if (Try-AcceptPaperTradingWarning -Shell $shell -ProcessId $ProcessId -WindowHandle $WindowHandle -Layout $layout -SkipForegroundCheck:$SkipForegroundCheck) {
             $accepted = $true
         }
         Start-Sleep -Seconds $waitSeconds
@@ -584,7 +1123,8 @@ function Try-AcceptPaperTradingWarningIfPresent {
 function Select-IbApiPaperMode {
     param(
         [IntPtr]$WindowHandle,
-        [hashtable]$Layout
+        [hashtable]$Layout,
+        [switch]$SkipForegroundCheck
     )
 
     if ($WindowHandle -eq [IntPtr]::Zero) {
@@ -593,10 +1133,10 @@ function Select-IbApiPaperMode {
 
     $ok = $true
     if (-not (Is-IbApiSelected -WindowHandle $WindowHandle -Layout $Layout)) {
-        $ok = (Try-SelectToggle -WindowHandle $WindowHandle -BaseX $Layout.ApiX -BaseY $Layout.ApiY -Verifier { Is-IbApiSelected -WindowHandle $WindowHandle -Layout $Layout }) -and $ok
+        $ok = (Try-SelectToggle -WindowHandle $WindowHandle -BaseX $Layout.ApiX -BaseY $Layout.ApiY -Verifier { Is-IbApiSelected -WindowHandle $WindowHandle -Layout $Layout } -SkipForegroundCheck:$SkipForegroundCheck) -and $ok
     }
     if (-not (Is-PaperTradingSelected -WindowHandle $WindowHandle -Layout $Layout)) {
-        $ok = (Try-SelectToggle -WindowHandle $WindowHandle -BaseX $Layout.PaperX -BaseY $Layout.PaperY -Verifier { Is-PaperTradingSelected -WindowHandle $WindowHandle -Layout $Layout }) -and $ok
+        $ok = (Try-SelectToggle -WindowHandle $WindowHandle -BaseX $Layout.PaperX -BaseY $Layout.PaperY -Verifier { Is-PaperTradingSelected -WindowHandle $WindowHandle -Layout $Layout } -SkipForegroundCheck:$SkipForegroundCheck) -and $ok
     }
     return $ok -and (Is-IbApiSelected -WindowHandle $WindowHandle -Layout $Layout)
 }
@@ -609,42 +1149,55 @@ function Send-LoginKeys {
         [string[]]$Titles,
         [string]$Username,
         [string]$Password,
-        [int]$Attempt
+        [int]$Attempt,
+        [switch]$SkipForegroundCheck
     )
 
     if ($WindowHandle -eq [IntPtr]::Zero) {
         $WindowHandle = Get-ProcessWindowHandle -ProcessId $ProcessId
     }
-    if (-not (Wait-ForForegroundWindow -ProcessId $ProcessId -WindowHandle $WindowHandle -TimeoutSec 2)) {
+    if (-not $SkipForegroundCheck -and -not (Wait-ForForegroundWindow -ProcessId $ProcessId -WindowHandle $WindowHandle -TimeoutSec 2)) {
         return $false
     }
     $WindowHandle = Get-ProcessWindowHandle -ProcessId $ProcessId
-    if (-not (Test-WindowIsForeground -WindowHandle $WindowHandle -ProcessId $ProcessId)) {
+    if (-not $SkipForegroundCheck -and -not (Test-WindowIsForeground -WindowHandle $WindowHandle -ProcessId $ProcessId)) {
         return $false
     }
 
     $layout = Get-LoginLayout -Attempt $Attempt
     Start-Sleep -Milliseconds 800
-    if (-not (Select-IbApiPaperMode -WindowHandle $WindowHandle -Layout $layout)) {
+    if (-not (Select-IbApiPaperMode -WindowHandle $WindowHandle -Layout $layout -SkipForegroundCheck:$SkipForegroundCheck)) {
         Write-Status "IB API switch failed; login fields will not be touched"
         return $false
     }
     Start-Sleep -Milliseconds 900
-    [void](Invoke-WindowClick -WindowHandle $WindowHandle -RelativeX $layout.UserX -RelativeY $layout.UserY -Clicks 2)
+    [void](Invoke-WindowClick -WindowHandle $WindowHandle -RelativeX $layout.UserX -RelativeY $layout.UserY -Clicks 2 -SkipForegroundCheck:$SkipForegroundCheck)
     Start-Sleep -Milliseconds 250
-    Paste-IntoFocusedField -Text $Username
-    [System.Windows.Forms.SendKeys]::SendWait("{TAB}")
+    [void](Paste-IntoFocusedField -Text $Username -WindowHandle $WindowHandle -DirectInput:$SkipForegroundCheck)
+    if ($SkipForegroundCheck) {
+        [void](Send-WindowVirtualKey -WindowHandle $WindowHandle -VirtualKey 0x09 -CharCode 0x09)
+    } else {
+        [System.Windows.Forms.SendKeys]::SendWait("{TAB}")
+    }
     Start-Sleep -Milliseconds 220
-    [void](Invoke-WindowClick -WindowHandle $WindowHandle -RelativeX $layout.PassX -RelativeY $layout.PassY -Clicks 1)
+    [void](Invoke-WindowClick -WindowHandle $WindowHandle -RelativeX $layout.PassX -RelativeY $layout.PassY -Clicks 1 -SkipForegroundCheck:$SkipForegroundCheck)
     Start-Sleep -Milliseconds 220
-    Paste-IntoFocusedField -Text $Password
-    [System.Windows.Forms.SendKeys]::SendWait("{TAB}")
+    [void](Paste-IntoFocusedField -Text $Password -WindowHandle $WindowHandle -DirectInput:$SkipForegroundCheck)
+    if ($SkipForegroundCheck) {
+        [void](Send-WindowVirtualKey -WindowHandle $WindowHandle -VirtualKey 0x09 -CharCode 0x09)
+    } else {
+        [System.Windows.Forms.SendKeys]::SendWait("{TAB}")
+    }
     Start-Sleep -Milliseconds 220
-    [void](Invoke-WindowClick -WindowHandle $WindowHandle -RelativeX $layout.LoginX -RelativeY $layout.LoginY -Clicks 1)
+    [void](Invoke-WindowClick -WindowHandle $WindowHandle -RelativeX $layout.LoginX -RelativeY $layout.LoginY -Clicks 1 -SkipForegroundCheck:$SkipForegroundCheck)
     Start-Sleep -Milliseconds 350
-    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    if ($SkipForegroundCheck) {
+        [void](Send-WindowVirtualKey -WindowHandle $WindowHandle -VirtualKey 0x0D -CharCode 0x0D)
+    } else {
+        [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    }
     Start-Sleep -Seconds 2
-    [void](Try-AcceptPaperTradingWarning -Shell $Shell -ProcessId $ProcessId -WindowHandle $WindowHandle -Layout $layout)
+    [void](Try-AcceptPaperTradingWarning -Shell $Shell -ProcessId $ProcessId -WindowHandle $WindowHandle -Layout $layout -SkipForegroundCheck:$SkipForegroundCheck)
     return $true
 }
 
@@ -661,8 +1214,12 @@ $configuredPort = Get-IntValue (Get-FirstEnvValue -Values $envVars -Names @("IBK
 $username = Get-FirstEnvValue -Values $envVars -Names @("IBKR_GATEWAY_USERNAME", "IBKR_USERNAME", "USERNAME")
 $password = Get-FirstEnvValue -Values $envVars -Names @("IBKR_GATEWAY_PASSWORD", "IBKR_PASSWORD", "PASSWORD")
 $portCandidates = Get-PortCandidates -ConfiguredPort $configuredPort -TradingMode $tradingMode
+$ibcRoot = Find-IbcRoot -EnvVars $envVars
 
 Write-Status "ensure started | host=$hostName | configured_port=$configuredPort | mode=$tradingMode"
+if ($ibcRoot) {
+    Write-Status "IBC detected at $ibcRoot"
+}
 
 $openPort = Get-OpenPort -HostName $hostName -Ports $portCandidates
 if ($null -ne $openPort) {
@@ -670,7 +1227,8 @@ if ($null -ne $openPort) {
     if ($runningAtStart.Count -gt 0) {
         $startPid = [int]$runningAtStart[0].Id
         $startWindowHandle = [IntPtr]$runningAtStart[0].MainWindowHandle
-        if (Try-AcceptPaperTradingWarningIfPresent -ProcessId $startPid -WindowHandle $startWindowHandle) {
+        $startupDesktopState = Get-DesktopState
+        if (Try-AcceptPaperTradingWarningIfPresent -ProcessId $startPid -WindowHandle $startWindowHandle -SkipForegroundCheck:$startupDesktopState.IsLocked) {
             Write-Status "paper trading warning acceptance attempted"
         }
     }
@@ -679,12 +1237,49 @@ if ($null -ne $openPort) {
 }
 
 $gatewayExe = Find-GatewayExecutable
+$gatewayDir = if ($gatewayExe) { Split-Path -Parent $gatewayExe } else { $null }
+$gatewayMajorVersion = Get-GatewayMajorVersion -GatewayExecutable $gatewayExe
+
+if (-not $SkipCredentialEntry -and -not $SwitchOnly -and -not [string]::IsNullOrWhiteSpace($ibcRoot)) {
+    if ([string]::IsNullOrWhiteSpace($username) -or [string]::IsNullOrWhiteSpace($password)) {
+        Write-Status "IBC startup skipped: missing gateway credentials in python-core/.env"
+    } elseif ($null -eq $gatewayMajorVersion) {
+        Write-Status "IBC startup skipped: gateway major version not detected"
+    } else {
+        $ibcConfigPath = Ensure-IbcRuntimeConfig -ProjectDir $ProjectDir -Username $username -Password $password -TradingMode $tradingMode -ApiPort $configuredPort
+        Write-Status "IBC runtime config prepared at $ibcConfigPath"
+
+        Stop-GatewayProcesses
+        Start-Sleep -Seconds 1
+
+        try {
+            $ibcLaunch = Start-GatewayViaIbc -ProjectDir $ProjectDir -IbcRoot $ibcRoot -GatewayMajorVersion $gatewayMajorVersion -ConfigPath $ibcConfigPath -TradingMode $tradingMode
+            if ($null -ne $ibcLaunch -and $null -ne $ibcLaunch.Process) {
+                Write-Status "IBC gateway start requested (pid $($ibcLaunch.Process.Id), version $gatewayMajorVersion)"
+                Write-Status "IBC launch context | program=$($ibcLaunch.ProgramPath) | settings=$($ibcLaunch.SettingsPath) | java=$($ibcLaunch.JavaExe)"
+                $ibcDeadline = (Get-Date).AddSeconds([Math]::Min([Math]::Max(30, $LoginTimeoutSec), 90))
+                while ((Get-Date) -lt $ibcDeadline) {
+                    $openPort = Get-OpenPort -HostName $hostName -Ports $portCandidates
+                    if ($null -ne $openPort) {
+                        Write-Status "gateway login confirmed by IBC on port $openPort"
+                        exit 0
+                    }
+                    Start-Sleep -Seconds 2
+                }
+                Write-Status "IBC did not confirm API availability within startup window; logs at $($ibcLaunch.LogDir); stderr=$($ibcLaunch.StderrPath); falling back to legacy recovery"
+            } else {
+                Write-Status "IBC gateway start could not be launched; falling back to legacy recovery"
+            }
+        } catch {
+            Write-Status "IBC startup failed: $($_.Exception.Message); falling back to legacy recovery"
+        }
+    }
+}
+
 if (-not $gatewayExe) {
     Write-Status "gateway executable not found"
     exit 2
 }
-
-$gatewayDir = Split-Path -Parent $gatewayExe
 
 $running = @(Get-GatewayProcesses)
 $gatewayPid = 0
@@ -731,6 +1326,7 @@ $foregroundStableSeconds = [Math]::Max(0, $ForegroundStableSec)
 $lastForegroundSwitchUtc = $null
 $nextForegroundRequestUtc = [DateTime]::MinValue
 $foregroundWaitLogged = $false
+$lastDesktopLocked = $null
 
 while ((Get-Date) -lt $deadline) {
     $now = Get-Date
@@ -744,45 +1340,60 @@ while ((Get-Date) -lt $deadline) {
         $gatewayWindowHandle = Get-ProcessWindowHandle -ProcessId $gatewayPid
     }
 
-    $isForeground = Test-WindowIsForeground -WindowHandle $gatewayWindowHandle -ProcessId $gatewayPid
-    if (-not $isForeground) {
-        $foregroundWaitLogged = $false
-        if ($now -ge $nextForegroundRequestUtc) {
-            $request = Request-ForegroundWindow -Shell $shell -ProcessId $gatewayPid -WindowHandle $gatewayWindowHandle -Titles $activationTitles -ActivationTimeoutSec 5
-            $gatewayWindowHandle = $request.WindowHandle
-            $lastForegroundSwitchUtc = Get-Date
-            $nextForegroundRequestUtc = $lastForegroundSwitchUtc.AddSeconds($foregroundRetrySeconds)
-            if ($request.Attempted) {
-                if ($request.IsForeground) {
-                    Write-Status "gateway window switched to foreground; waiting $foregroundStableSeconds seconds before login"
-                } else {
-                    Write-Status "gateway window focus requested; waiting for foreground"
-                }
-            } else {
-                Write-Status "gateway window focus requested; window handle is not ready yet"
-            }
+    $desktopState = Get-DesktopState
+    $skipForegroundChecks = $desktopState.IsLocked
+    if ($lastDesktopLocked -ne $skipForegroundChecks) {
+        if ($skipForegroundChecks) {
+            Write-Status "desktop '$($desktopState.DesktopName)' detected; skipping foreground checks while workstation is locked"
+        } else {
+            Write-Status "desktop '$($desktopState.DesktopName)' detected; foreground checks enabled"
         }
-        Start-Sleep -Seconds 1
-        continue
+        $lastDesktopLocked = $skipForegroundChecks
     }
 
-    if ($null -ne $lastForegroundSwitchUtc) {
-        $stableForSec = ($now - $lastForegroundSwitchUtc).TotalSeconds
-        if ($stableForSec -lt $foregroundStableSeconds) {
-            if (-not $foregroundWaitLogged) {
-                $remaining = [Math]::Ceiling($foregroundStableSeconds - $stableForSec)
-                Write-Status "gateway window is foreground; waiting ${remaining}s before login"
-                $foregroundWaitLogged = $true
+    if (-not $skipForegroundChecks) {
+        $isForeground = Test-WindowIsForeground -WindowHandle $gatewayWindowHandle -ProcessId $gatewayPid
+        if (-not $isForeground) {
+            $foregroundWaitLogged = $false
+            if ($now -ge $nextForegroundRequestUtc) {
+                $request = Request-ForegroundWindow -Shell $shell -ProcessId $gatewayPid -WindowHandle $gatewayWindowHandle -Titles $activationTitles -ActivationTimeoutSec 5
+                $gatewayWindowHandle = $request.WindowHandle
+                $lastForegroundSwitchUtc = Get-Date
+                $nextForegroundRequestUtc = $lastForegroundSwitchUtc.AddSeconds($foregroundRetrySeconds)
+                if ($request.Attempted) {
+                    if ($request.IsForeground) {
+                        Write-Status "gateway window switched to foreground; waiting $foregroundStableSeconds seconds before login"
+                    } else {
+                        Write-Status "gateway window focus requested; waiting for foreground"
+                    }
+                } else {
+                    Write-Status "gateway window focus requested; window handle is not ready yet"
+                }
             }
             Start-Sleep -Seconds 1
             continue
         }
+
+        if ($null -ne $lastForegroundSwitchUtc) {
+            $stableForSec = ($now - $lastForegroundSwitchUtc).TotalSeconds
+            if ($stableForSec -lt $foregroundStableSeconds) {
+                if (-not $foregroundWaitLogged) {
+                    $remaining = [Math]::Ceiling($foregroundStableSeconds - $stableForSec)
+                    Write-Status "gateway window is foreground; waiting ${remaining}s before login"
+                    $foregroundWaitLogged = $true
+                }
+                Start-Sleep -Seconds 1
+                continue
+            }
+        }
+    } else {
+        $foregroundWaitLogged = $false
     }
     $foregroundWaitLogged = $false
 
     $attempt++
     $layout = Get-LoginLayout -Attempt $attempt
-    $switched = Select-IbApiPaperMode -WindowHandle $gatewayWindowHandle -Layout $layout
+    $switched = Select-IbApiPaperMode -WindowHandle $gatewayWindowHandle -Layout $layout -SkipForegroundCheck:$skipForegroundChecks
     if ($SwitchOnly) {
         if ($switched) {
             Write-Status "switch-only attempt $attempt confirmed"
@@ -795,12 +1406,12 @@ while ((Get-Date) -lt $deadline) {
         continue
     }
 
-    if (Send-LoginKeys -Shell $shell -ProcessId $gatewayPid -WindowHandle $gatewayWindowHandle -Titles $activationTitles -Username $username -Password $password -Attempt $attempt) {
+    if (Send-LoginKeys -Shell $shell -ProcessId $gatewayPid -WindowHandle $gatewayWindowHandle -Titles $activationTitles -Username $username -Password $password -Attempt $attempt -SkipForegroundCheck:$skipForegroundChecks) {
         Write-Status "login attempt $attempt sent"
         for ($i = 0; $i -lt 10; $i++) {
             Start-Sleep -Seconds 2
             $layout = Get-LoginLayout -Attempt $attempt
-            [void](Try-AcceptPaperTradingWarning -Shell $shell -ProcessId $gatewayPid -WindowHandle $gatewayWindowHandle -Layout $layout)
+            [void](Try-AcceptPaperTradingWarning -Shell $shell -ProcessId $gatewayPid -WindowHandle $gatewayWindowHandle -Layout $layout -SkipForegroundCheck:$skipForegroundChecks)
             $openPort = Get-OpenPort -HostName $hostName -Ports $portCandidates
             if ($null -ne $openPort) {
                 Write-Status "gateway login confirmed on port $openPort"
@@ -808,7 +1419,11 @@ while ((Get-Date) -lt $deadline) {
             }
         }
     } else {
-        Write-Status "login attempt $attempt deferred: gateway window lost foreground"
+        if ($skipForegroundChecks) {
+            Write-Status "login attempt $attempt failed before key entry in locked-session mode"
+        } else {
+            Write-Status "login attempt $attempt deferred: gateway window lost foreground"
+        }
     }
 
     $lastForegroundSwitchUtc = Get-Date

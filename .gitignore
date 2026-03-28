@@ -14,6 +14,7 @@ _transfer/
 # LLM runtime assets
 LLM/models/
 LLM/llama/
+LLM/LLM-Chat/
 
 # Keep curated project skills if desired
 !LLM/
