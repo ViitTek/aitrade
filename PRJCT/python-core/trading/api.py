@@ -2778,6 +2778,10 @@ async def get_data_coverage(days: int = 60, tf: int = 60):
         set(_parse_symbols(settings.SYMBOLS))
         | set(_parse_symbols(settings.BINANCE_SYMBOLS))
         | set(_parse_symbols(settings.ALWAYS_ACTIVE_SYMBOLS))
+        | set(_parse_symbols(getattr(settings, "IBKR_SYMBOLS", "") or ""))
+        | set(_parse_symbols(getattr(settings, "CROSS_ASSET_FX_SYMBOLS", "") or ""))
+        | set(_parse_symbols(getattr(settings, "CROSS_ASSET_COMMODITY_SYMBOLS", "") or ""))
+        | set(_parse_symbols(getattr(settings, "CROSS_ASSET_INDEX_SYMBOLS", "") or ""))
     )
     if not symbols:
         symbols = sorted(db.market_candles.distinct("symbol", {"tf": tf}))
@@ -2796,6 +2800,7 @@ async def get_data_coverage(days: int = 60, tf: int = 60):
     for sym in symbols:
         base = sym.split("/")[0].upper()
         candle_hours = set()
+        cross_asset_hours = set()
         intel_hours = set()
         funding_hours = set()
         sentiment_hours = set()
@@ -2807,6 +2812,14 @@ async def get_data_coverage(days: int = 60, tf: int = 60):
             hk = _hour_key_from_candle_t(str(c.get("t", "")))
             if hk:
                 candle_hours.add(hk)
+
+        for c in db.cross_asset_candles.find(
+            {"symbol": sym, "timestamp": {"$gte": since_dt}},
+            {"_id": 0, "timestamp": 1},
+        ):
+            ts = c.get("timestamp")
+            if isinstance(ts, datetime):
+                cross_asset_hours.add(_hour_key_from_dt(ts))
 
         for f in db.funding_oi.find(
             {"symbol": sym, "timestamp": {"$gte": since_dt}},
@@ -2831,10 +2844,12 @@ async def get_data_coverage(days: int = 60, tf: int = 60):
                 sentiment_hours.add(_hour_key_from_dt(ts))
 
         candle_n = len(candle_hours)
+        cross_asset_n = len(cross_asset_hours)
         intel_cov = (len(candle_hours & intel_hours) / candle_n * 100.0) if candle_n > 0 else 0.0
         funding_cov = (len(candle_hours & funding_hours) / candle_n * 100.0) if candle_n > 0 else 0.0
         sentiment_cov = (len(candle_hours & sentiment_hours) / candle_n * 100.0) if candle_n > 0 else 0.0
 
+        last_cross_asset = db.cross_asset_candles.find_one({"symbol": sym}, sort=[("timestamp", -1)])
         last_funding = db.funding_oi.find_one({"symbol": sym}, sort=[("timestamp", -1)])
         last_intel = db.market_intel.find_one({f"assets.{base}": {"$exists": True}}, sort=[("created_at", -1)])
         last_sentiment = db.sentiments.find_one({"symbols": base}, sort=[("created_at", -1)])
@@ -2853,6 +2868,7 @@ async def get_data_coverage(days: int = 60, tf: int = 60):
             {
                 "symbol": sym,
                 "candle_hours": candle_n,
+                "cross_asset_hours": cross_asset_n,
                 "intel_hours": len(intel_hours),
                 "funding_hours": len(funding_hours),
                 "sentiment_hours": len(sentiment_hours),
@@ -2861,10 +2877,13 @@ async def get_data_coverage(days: int = 60, tf: int = 60):
                 "intel_coverage_pct": round(intel_cov, 1),
                 "funding_coverage_pct": round(funding_cov, 1),
                 "sentiment_coverage_pct": round(sentiment_cov, 1),
+                "last_cross_asset_at": last_cross_asset.get("timestamp").isoformat() if last_cross_asset and hasattr(last_cross_asset.get("timestamp"), "isoformat") else None,
+                "cross_asset_provider": str(last_cross_asset.get("provider") or "") if last_cross_asset else None,
                 "last_intel_at": last_intel.get("created_at").isoformat() if last_intel and hasattr(last_intel.get("created_at"), "isoformat") else None,
                 "last_funding_at": last_funding.get("timestamp").isoformat() if last_funding and hasattr(last_funding.get("timestamp"), "isoformat") else None,
                 "last_sentiment_at": last_sentiment.get("created_at").isoformat() if last_sentiment and hasattr(last_sentiment.get("created_at"), "isoformat") else None,
                 "last_news_at": last_news_ts.isoformat() if last_news_ts and hasattr(last_news_ts, "isoformat") else None,
+                "cross_asset_staleness_h": _hours_ago(last_cross_asset.get("timestamp") if last_cross_asset else None),
                 "intel_staleness_h": _hours_ago(last_intel.get("created_at") if last_intel else None),
                 "funding_staleness_h": _hours_ago(last_funding.get("timestamp") if last_funding else None),
                 "sentiment_staleness_h": _hours_ago(last_sentiment.get("created_at") if last_sentiment else None),

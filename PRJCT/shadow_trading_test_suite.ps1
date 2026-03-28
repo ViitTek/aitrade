@@ -313,6 +313,34 @@ function Build-Final([int[]]$hs, $state) {
   Write-JsonAtomic -Path (Join-Path $RunDir "final_report.txt") -Content ($txt -join [Environment]::NewLine)
 }
 
+function Finalize-Run([int[]]$hs, $state, [string]$completionReason = "target_elapsed") {
+  $state.completed = $true
+  $state.completion_reason = $completionReason
+  $state.completed_at = (Get-Date).ToString("o")
+  Save-State $state
+  Write-Heartbeat -state "finalizing"
+  Console-Status "FINALIZE_START reason=$completionReason"
+
+  try {
+    Build-Final -hs $hs -state $state
+    Log "FINALIZE_OK reason=$completionReason"
+  } catch {
+    $errMsg = $_.Exception.Message
+    $stack = $_.ScriptStackTrace
+    Log "FINALIZE_ERR reason=$completionReason err=$errMsg"
+    if (-not [string]::IsNullOrWhiteSpace($stack)) {
+      Log "FINALIZE_STACK $stack"
+    }
+    Console-Status "FINALIZE_ERR reason=$completionReason err=$errMsg"
+  }
+
+  Save-State $state
+  Write-Heartbeat -state "end"
+  Log "END"
+  Console-Status "RUNNER_END run_dir=$RunDir completion_reason=$completionReason"
+  Write-Output "SHADOW_TEST_DONE: $RunDir"
+}
+
 $hs = Parse-Horizons -src $Horizons
 if ($hs.Count -eq 0) { throw "No valid horizons in '$Horizons'" }
 
@@ -396,10 +424,4 @@ while ($true) {
   Start-Sleep -Seconds 60
 }
 
-Build-Final -hs $hs -state $state
-$state.completed = $true
-Save-State $state
-Write-Heartbeat -state "end"
-Log "END"
-Console-Status "RUNNER_END run_dir=$RunDir"
-Write-Output "SHADOW_TEST_DONE: $RunDir"
+Finalize-Run -hs $hs -state $state -completionReason "target_elapsed"

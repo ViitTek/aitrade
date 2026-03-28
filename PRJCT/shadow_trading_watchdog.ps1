@@ -124,13 +124,21 @@ function Try-CloseExpiredRun([string]$runDir) {
   try { $targetDurationSec = [int]$state.target_duration_sec } catch { $targetDurationSec = 0 }
   if ([string]::IsNullOrWhiteSpace($startedAtRaw) -or $targetDurationSec -le 0) { return $false }
   try {
-    $deadline = ([datetimeoffset]::Parse($startedAtRaw)).AddSeconds($targetDurationSec + 1800)
-    if ((Get-Date) -lt $deadline.LocalDateTime) { return $false }
+    $deadline = ([datetimeoffset]::Parse($startedAtRaw)).AddSeconds($targetDurationSec)
+    $finalizeGraceSec = [Math]::Max(180, ($PollSeconds * 2))
+    $closeAfter = $deadline.AddSeconds($finalizeGraceSec)
+    if ((Get-Date) -lt $closeAfter.LocalDateTime) { return $false }
   } catch {
     return $false
   }
 
-  foreach ($proc in @(Get-RunnerProcesses -runDir $runDir)) {
+  $runnerProcs = @(Get-RunnerProcesses -runDir $runDir)
+  $hbAge = Get-HeartbeatAgeSeconds -runDir $runDir
+  if (@($runnerProcs).Count -gt 0 -and ($hbAge -eq $null -or $hbAge -lt [Math]::Max(300, $StaleThresholdSec))) {
+    return $false
+  }
+
+  foreach ($proc in $runnerProcs) {
     try {
       Stop-Process -Id ([int]$proc.ProcessId) -Force -ErrorAction Stop
       Log "RUNNER_KILLED_EXPIRED pid=$($proc.ProcessId)" $runDir
@@ -141,11 +149,13 @@ function Try-CloseExpiredRun([string]$runDir) {
 
   try {
     $state.completed = $true
+    $state.completion_reason = "watchdog_expired_close"
+    $state.completed_at = (Get-Date).ToString("o")
     Save-StateSnapshot -runDir $runDir -state $state
   } catch {
     Log "STATE_COMPLETE_FAILED err=$($_.Exception.Message)" $runDir
   }
-  Log "WATCHDOG_END completed=true expired_run=1" $runDir
+  Log "WATCHDOG_END completed=true expired_run=1 hb_age_sec=$hbAge runner_procs=$(@($runnerProcs).Count)" $runDir
   return $true
 }
 

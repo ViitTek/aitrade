@@ -46,6 +46,11 @@ YF_MAP: Dict[str, str] = {
 }
 
 
+def _max_staleness_hours() -> float:
+    interval_min = max(1, int(getattr(settings, "INTERVAL_MINUTES", 60) or 60))
+    return max(3.0, (interval_min / 60.0) * 3.0)
+
+
 def _parse_list(src: str) -> List[str]:
     return [x.strip().upper() for x in str(src or "").split(",") if x.strip()]
 
@@ -230,6 +235,9 @@ def _fetch_ibkr(ib: IB, symbol: str) -> Tuple[datetime, float, float, float, flo
         raise ValueError(f"no ibkr bars: {symbol}")
     bar = max(bars, key=lambda b: b.date)
     ts = bar.date.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    staleness_h = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
+    if staleness_h > _max_staleness_hours():
+        raise ValueError(f"stale ibkr bars: {symbol} age_h={staleness_h:.2f}")
     return ts, float(bar.open), float(bar.high), float(bar.low), float(bar.close), float(getattr(bar, "volume", 0.0) or 0.0)
 
 
@@ -254,9 +262,9 @@ def _fetch_with_fallback(symbol: str, primary_provider: str, ib: IB | None) -> T
     if primary_provider == "stooq":
         providers = ["stooq", "yahoo"]
     elif primary_provider == "yahoo":
-        providers = ["yahoo"]
+        providers = ["yahoo", "stooq"]
     elif primary_provider == "ibkr":
-        providers = ["ibkr", "yahoo"]
+        providers = ["ibkr", "yahoo", "stooq"]
     else:
         providers = [primary_provider]
 
@@ -296,7 +304,18 @@ def run_once() -> Dict[str, int]:
     now = datetime.now(timezone.utc)
     try:
         if provider == "ibkr":
-            ib = _connect_ibkr_shadow()
+            try:
+                ib = _connect_ibkr_shadow()
+            except Exception as e:
+                db.bot_events.insert_one(
+                    {
+                        "run_id": "cross-asset-shadow",
+                        "t": now.isoformat().replace("+00:00", "Z"),
+                        "event": "cross_asset_ibkr_connect_error",
+                        "detail": str(e),
+                    }
+                )
+                ib = None
         elif provider not in {"stooq", "yahoo"}:
             raise ValueError(f"unsupported cross-asset provider: {provider}")
 
